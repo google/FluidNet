@@ -222,21 +222,21 @@ function torch.defineModelGraph(conf, mconf, data)
     --]]
   else
     -- Full (slow) model.
+    --[[
     osize = {16, 16, 32, 64, 32, 32}
     ksize = {5, 5, 3, 3, 1, 1}
     psize = {2, 1, 1, 1, 1, 1}
     usize = {1, 1, 1, 1, 1, 1}
     lastLayerKSize = 3
     lastLayerUSize = 2
+    --]]
     -- 30fps model.
-    --[[
     osize = {16, 16, 16, 16, 32, 32}
     ksize = {3, 3, 3, 3, 1, 1}
     psize = {2, 2, 1, 1, 1, 1}
     usize = {1, 1, 1, 1, 1, 2}
     lastLayerKSize = 3
     lastLayerUSize = 2
-    --]]
   end
   
   assert(#osize == #ksize and #osize >= 1)

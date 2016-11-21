@@ -1,7 +1,7 @@
 FluidNet 
 ============
 
-![alt text](https://github.com/jonathantompson/FluidNet/blob/master/sample.png "Sample png")
+![alt text](https://github.com/google/FluidNet/blob/master/sample.png "Sample png")
 
 This repo contains all the code required to replicate the paper:
 
