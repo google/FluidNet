@@ -1,0 +1,17 @@
+Download LDT for eclipse
+http://www.eclipse.org/ldt/
+
+open window->preferences->Lua->interpreters
+Add
+Type: LuaJit 2.0
+interpreter executable: torch/install/bin/qlua
+Linked Execution Environment: lua-5.1
+Interpreter arguments: prepend -lenv to environment
+Add env variable: Hit "Add.."  TERM, xterm
+
+
+luarocks install luasocket
+
+Leave everything else as default
+
+
