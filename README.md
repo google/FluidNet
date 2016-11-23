@@ -25,7 +25,7 @@ Note: This is not an official Google product.
 --------------------
 
 ```
-git clone git@github.com:jonathantompson/FluidNet.git
+git clone git@github.com:google/FluidNet.git
 ```
 
 #1. Generating the data
