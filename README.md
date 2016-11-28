@@ -51,6 +51,12 @@ chmod u+x binvox
 python generate_binvox_files.py
 ```
 
+Note: some users have reported that they need to install ``lib3ds-1-3``:
+
+```
+sudo apt-get install lib3ds-1-3
+```
+
 OPTIONAL: You can view the output by using the viewvox utility (http://www.patrickmin.com/viewvox/). Put the viewvox executable in the ``FluidNet/voxelizer/voxels`` directory, then:
 
 ```
