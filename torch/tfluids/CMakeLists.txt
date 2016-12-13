@@ -44,5 +44,5 @@ SET(luasrc init.lua test_tfluids.lua)
 SET(src init.cu)
 
 ADD_TORCH_PACKAGE(tfluids "${src}" "${luasrc}" "Torch Fluids utility lib.")
-TARGET_LINK_LIBRARIES(tfluids luaT TH ${OPENGL_LIBRARIES} ${GLUT_LIBRARY})
+TARGET_LINK_LIBRARIES(tfluids luaT TH ${OPENGL_LIBRARIES} ${GLUT_LIBRARY} ${CUDA_cusparse_LIBRARY})
 

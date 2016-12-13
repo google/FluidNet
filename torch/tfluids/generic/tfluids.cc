@@ -1940,6 +1940,11 @@ static int tfluids_(Main_calcVelocityDivergenceBackward)(lua_State *L) {
   return 0;
 }
 
+static int tfluids_(Main_solveLinearSystemPCG)(lua_State *L) {
+  luaL_error(L, "ERROR: solveLinearSystemPCG not defined for CPU tensors.");
+  return 0;
+}
+
 static const struct luaL_Reg tfluids_(Main__) [] = {
   {"advectScalar", tfluids_(Main_advectScalar)},
   {"advectVel", tfluids_(Main_advectVel)}, 
@@ -1954,6 +1959,7 @@ static const struct luaL_Reg tfluids_(Main__) [] = {
   {"calcVelocityDivergence", tfluids_(Main_calcVelocityDivergence)},
   {"calcVelocityDivergenceBackward",
    tfluids_(Main_calcVelocityDivergenceBackward)},
+  {"solveLinearSystemPCG", tfluids_(Main_solveLinearSystemPCG)},
   {NULL, NULL}  // NOLINT
 };
 

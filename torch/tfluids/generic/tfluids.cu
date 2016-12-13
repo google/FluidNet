@@ -15,6 +15,7 @@
 #include "luaT.h"
 #include "THC.h"
 
+#include <cusparse.h>
 #include <float.h>
 #include "THCDeviceTensor.cuh"
 #include "THCDeviceTensorUtils.cuh"
@@ -34,6 +35,17 @@ struct THCState* cutorch_getstate(lua_State* L) {
   struct THCState* state = reinterpret_cast<THCState*>(lua_touserdata(L, -1));
   lua_pop(L, 2);
   return state;
+}
+
+static cusparseHandle_t cusparse_handle = 0;
+
+static void init_cusparse() {
+  if (cusparse_handle == 0) {
+    cusparseStatus_t status = cusparseCreate(&cusparse_handle);
+    if (status != CUSPARSE_STATUS_SUCCESS) {
+      THError("CUSPARSE Library initialization failed");
+    }
+  }
 }
 
 // averageBorderCells CUDA kernel
@@ -1016,6 +1028,57 @@ static int tfluids_CudaMain_calcVelocityDivergenceBackward(lua_State *L) {
   return 0;
 }
 
+// solveLinearSystemPCG lua entry point.
+static int tfluids_CudaMain_solveLinearSystemPCG(lua_State *L) {
+  THCState* state = cutorch_getstate(L);
+  THCudaTensor* delta_u = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 1, "torch.CudaTensor"));
+  THCudaTensor* p = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 2, "torch.CudaTensor"));
+  THCudaTensor* geom = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 3, "torch.CudaTensor"));
+  THCudaTensor* u = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 4, "torch.CudaTensor"));
+
+  if (delta_u->nDimension != 5 || p->nDimension != 4 || geom->nDimension != 4 ||
+      u->nDimension != 5) {
+    luaL_error(L, "Incorrect dimensions. "
+                  "Expect delta_u: 5, p: 4, geom: 4, u: 5.");
+  }
+  const int32_t nbatch = delta_u->size[0];
+  const int32_t nuchan = delta_u->size[1];  // Can only be 2 or 3.
+  const int32_t zdim = delta_u->size[2];
+  const int32_t ydim = delta_u->size[3];
+  const int32_t xdim = delta_u->size[4];
+  THCDeviceTensor<float, 5> dev_delta_u =
+      toDeviceTensor<float, 5>(state, delta_u);
+  THCDeviceTensor<float, 4> dev_p = toDeviceTensor<float, 4>(state, p);
+  THCDeviceTensor<float, 4> dev_geom = toDeviceTensor<float, 4>(state, geom);
+  THCDeviceTensor<float, 5> dev_u = toDeviceTensor<float, 5>(state, u);
+
+  if (nuchan != 2 && nuchan != 3) {
+    luaL_error(L, "Incorrect number of velocity channels.");
+  }
+
+  // Get raw ptrs.
+  const float* ptr_delta_u = dev_delta_u.data();
+  const float* ptr_p = dev_p.data();
+  const float* ptr_geom = dev_geom.data();
+  const float* ptr_u = dev_u.data();
+
+  init_cusparse();  // No op if already initialized.
+
+  // MAKE SURE THE cuSPARSE LIBRARY IS BOUND CORRECTLY. DONOTSUBMIT.
+  cusparseMatDescr_t descr = 0;  // DONOTSUBMIT
+  cusparseCreateMatDescr(&descr);  // DONOTSUBMIT
+  cusparseSetMatType(descr, CUSPARSE_MATRIX_TYPE_GENERAL);  // DONOTSUBMIT
+  cusparseSetMatIndexBase(descr, CUSPARSE_INDEX_BASE_ONE);  // DONOTSUBMIT
+
+  luaL_error(L, "ERROR: solveLinearSystemPCG not implemented");  // DONOTSUBMIT
+ 
+  return 0;
+}
+
 static const struct luaL_Reg tfluids_CudaMain__ [] = {
   {"averageBorderCells", tfluids_CudaMain_averageBorderCells},
   {"setObstacleBcs", tfluids_CudaMain_setObstacleBcs},
@@ -1025,6 +1088,7 @@ static const struct luaL_Reg tfluids_CudaMain__ [] = {
   {"calcVelocityDivergence", tfluids_CudaMain_calcVelocityDivergence},
   {"calcVelocityDivergenceBackward",
    tfluids_CudaMain_calcVelocityDivergenceBackward},
+  {"solveLinearSystemPCG", tfluids_CudaMain_solveLinearSystemPCG},
   {NULL, NULL}  // NOLINT
 };
 

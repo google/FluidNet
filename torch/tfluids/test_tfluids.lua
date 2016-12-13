@@ -257,6 +257,33 @@ function test.calcVelocityUpdateCUDA()
   end
 end
 
+function test.solveLinearSystemPCGCUDA()
+  local batchSize = torch.random(1, 3)
+  local w = torch.random(32, 64)
+  local h = torch.random(32, 64)
+  for dim = 2, 3 do
+    local d
+    if dim == 3 then
+      d = torch.random(32, 64)
+    else
+      d = 1
+    end
+
+    -- Create some random inputs.
+    local geom = torch.rand(batchSize, d, h, w):gt(0.8):cuda()
+    local p = torch.rand(batchSize, d, h, w):cuda()
+    local U = torch.rand(batchSize, dim, d, h, w):cuda()
+
+    -- Allocate the output tensor.
+    local deltaU = torch.CudaTensor(batchSize, dim, d, h, w)
+
+    -- Call the forward function.
+    tfluids.solveLinearSystemPCG(deltaU, p, geom, U)
+
+    -- TODO(kris): Check the output.
+  end
+end
+
 function test.calcVelocityDivergenceCUDA()
   -- NOTE: The forward and backward function tests are in:
   -- torch/lib/modules/test_velocity_divergence.lua

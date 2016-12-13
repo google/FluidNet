@@ -226,6 +226,35 @@ local function calcVelocityUpdate(deltaU, p, geom, matchManta)
 end
 rawset(tfluids, 'calcVelocityUpdate', calcVelocityUpdate)
 
+-- Calculate velocity update using cuSPARSE (NVIDIA) library's PCG
+-- implementation. Note: there's no backward version of this function.
+--
+-- @param deltaU: The velocity update to zero the divergence of U.
+-- @param p: The p field from the previous timestep.
+-- @param geom: The current geometry field.
+-- @param U: The DIVERGENT velocity field for the current timestep.
+local function solveLinearSystemPCG(deltaU, p, geom, U)
+  assert(deltaU:dim() == 5 and p:dim() == 4 and geom:dim() == 4)
+  local nbatch = deltaU:size(1)
+  local twoDim = deltaU:size(2) == 2
+  local zdim = deltaU:size(3)
+  local ydim = deltaU:size(4)
+  local xdim = deltaU:size(5)
+  if not twoDim then
+    assert(deltaU:size(2) == 3, 'Bad number of velocity slices')
+  end
+  assert(deltaU:isSameSizeAs(U))
+  assert(p:isSameSizeAs(geom))
+  assert(p:size(1) == nbatch)
+  assert(p:size(2) == zdim)
+  assert(p:size(3) == ydim)
+  assert(p:size(4) == xdim)
+  assert(p:isContiguous() and deltaU:isContiguous() and geom:isContiguous() and
+         U:isContiguous())
+  deltaU.tfluids.solveLinearSystemPCG(deltaU, p, geom, U)
+end
+rawset(tfluids, 'solveLinearSystemPCG', solveLinearSystemPCG)
+
 -- Calculates the partial derivative of calcVelocityUpdate.
 local function calcVelocityUpdateBackward(gradP, p, geom, gradOutput,
                                           matchManta)
