@@ -110,14 +110,14 @@ Now you're ready to generate the training data. Make sure the directory `data/da
 
 ```
 cd FluidNet/manta/build
-./manta ../scenes/_trainingData.py --dim 3 --addGeometryType 'model'
+./manta ../scenes/_trainingData.py --dim 3 --addModelGeometry True --addSphereGeometry True
 ```
 
 For the 2D data run:
 
 ```
 cd FluidNet/manta/build
-./manta ../scenes/_trainingData.py --dim 2 --addGeometryType 'model'
+./manta ../scenes/_trainingData.py --dim 2 --addModelGeometry True --addSphereGeometry True
 ```
 
 #2. Training the model
