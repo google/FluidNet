@@ -18,6 +18,7 @@
 
 #include <TH.h>
 #include <luaT.h>
+#include "generic/tfluids.cu.h"
 
 // This type is common to both float and double implementations and so has
 // to be defined outside tfluids.cc.
@@ -42,14 +43,41 @@ inline int32_t ClampInt32(const int32_t x, const int32_t low,
   return std::max<int32_t>(std::min<int32_t>(x, high), low);
 }
 
-#include "generic/tfluids.cu"
-
 #define torch_(NAME) TH_CONCAT_3(torch_, Real, NAME)
 #define torch_Tensor TH_CONCAT_STRING_3(torch., Real, Tensor)
 #define tfluids_(NAME) TH_CONCAT_3(tfluids_, Real, NAME)
 
+// Note: instead of calling THGenerateFloatTypes.h, we're going to hack into
+// the torch build system a little bit. This makes the tfluids library
+// compatible with the blaze build system (for reasons that aren't interesting,
+// but are very annoying).
+#define TH_GENERIC_FILE
+
+#define real float
+#define accreal double
+#define Real Float
+#define THInf FLT_MAX
+#define TH_REAL_IS_FLOAT
 #include "generic/tfluids.cc"
-#include "THGenerateFloatTypes.h"
+#undef accreal
+#undef real
+#undef Real
+#undef THInf
+#undef TH_REAL_IS_FLOAT
+
+#define real double
+#define accreal double
+#define Real Double
+#define THInf DBL_MAX
+#define TH_REAL_IS_DOUBLE
+#include "generic/tfluids.cc"
+#undef accreal
+#undef real
+#undef Real
+#undef THInf
+#undef TH_REAL_IS_DOUBLE
+
+#undef TH_GENERIC_FILE
 
 LUA_EXTERNC DLL_EXPORT int luaopen_libtfluids(lua_State *L) {
   tfluids_FloatMain_init(L);
@@ -69,7 +97,7 @@ LUA_EXTERNC DLL_EXPORT int luaopen_libtfluids(lua_State *L) {
   lua_setfield(L, -2, "float");
 
   lua_newtable(L);
-  luaT_setfuncs(L, tfluids_CudaMain__, 0);
+  luaT_setfuncs(L, tfluids_CudaMain_getMethodsTable(), 0);
   lua_setfield(L, -2, "cuda");
 
   return 1;

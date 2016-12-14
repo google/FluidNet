@@ -41,7 +41,7 @@ ADD_DEFINITIONS(${OpenGL_DEFINITIONS})
 SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -fPIC -D_MWAITXINTRIN_H_INCLUDED -D_FORCE_INLINE -D__STRICT_ANSI__")
 
 SET(luasrc init.lua test_tfluids.lua)
-SET(src init.cu)
+SET(src init.cu generic/tfluids.cu generic/tfluids.cu.h)
 
 ADD_TORCH_PACKAGE(tfluids "${src}" "${luasrc}" "Torch Fluids utility lib.")
 TARGET_LINK_LIBRARIES(tfluids luaT TH ${OPENGL_LIBRARIES} ${GLUT_LIBRARY} ${CUDA_cusparse_LIBRARY})

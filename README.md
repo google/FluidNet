@@ -135,6 +135,12 @@ cd FluidNet/torch/tfluids
 luarocks make tfluids-1-00.rockspec
 ```
 
+Note: some users are reporting that you need to explicitly install findCUDA for tfluids to compile properly with CUDA 7.5 and above.
+
+```
+luarocks install findCUDA
+```
+
 All training related code is in `torch/` directory.  To train a model on 3D data:
 
 ```

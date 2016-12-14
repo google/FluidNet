@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "luaT.h"
-#include "THC.h"
+#include <TH.h>
+#include <THC.h>
+#include <luaT.h>
 
+#include <assert.h>
 #include <cusparse.h>
 #include <float.h>
+#include <algorithm>
 #include "THCDeviceTensor.cuh"
 #include "THCDeviceTensorUtils.cuh"
 #include "THCDeviceUtils.cuh"
@@ -1091,6 +1094,10 @@ static const struct luaL_Reg tfluids_CudaMain__ [] = {
   {"solveLinearSystemPCG", tfluids_CudaMain_solveLinearSystemPCG},
   {NULL, NULL}  // NOLINT
 };
+
+const struct luaL_Reg* tfluids_CudaMain_getMethodsTable() {
+  return tfluids_CudaMain__;
+}
 
 void tfluids_CudaMain_init(lua_State *L) {
   luaT_pushmetatable(L, "torch.CudaTensor");
