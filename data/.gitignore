@@ -2,3 +2,5 @@ datasets
 *.avi
 models/*
 models_*
+images
+models

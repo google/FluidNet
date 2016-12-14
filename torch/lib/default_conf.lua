@@ -23,11 +23,10 @@ function torch.defaultConf()
   -- Please keep this table in alphabetical order.
   local conf = {
     batchSize = 16,  -- Definitely depends heavily on model and dataset
-    cacheDir = '../data/datasets/',  -- Directory to cache binary results
+    dataDir = '../data/datasets/',  -- Where the unprocessed data is stored.
     dataset = 'output_current_model_sphere',  -- Default: 2D with geometry.
     gpu = 1,  -- Cuda GPU to use 
     ignoreFrames = 0,  -- Ignore the first 'n' frames of each run
-    imageDir = '../data/images/',
     -- lrEpochMults: pairs of {epoch, multiplier}. We will
     -- apply the specified multiplier to the learning rate at each epoch. E.g.
     -- lrEpochMults = {{epoch=35, mult=0.25}},
@@ -111,7 +110,6 @@ function torch.defaultConf()
     profile = false,  -- Requires ProFi.
     profileFPROPTime = 10,  -- Set to zero to disable profiling on startup.
     resumeTraining = false,
-    srcDir = '../data/datasets/',  -- Where the unprocessed data is stored.
     train = true,  -- perform training (otherwise just evaluate)
     trainPerturb = {
       flipProb = 0.5,
@@ -125,7 +123,6 @@ function torch.defaultConf()
       timeScaleSigma = 1,
       transPix = 0,  -- NOT SUPPORTED.
     },
-    visualize = false,
   }
   return conf
 end

@@ -16,8 +16,8 @@ local paths = require('paths')
 
 function torch.loadSet(conf, dataType)
   local data
-  local filename = conf.cacheDir .. '/preprocessed_' .. conf.dataset .. '_' ..
-                   dataType .. '.bin'
+  local filename = (conf.dataDir .. '/' .. conf.dataset .. '/preprocessed_' ..
+                    conf.dataset .. '_' .. dataType .. '.bin')
   if paths.filep(filename) then
     print('Loading preprocessed file ' .. filename)
     data = torch.load(filename)

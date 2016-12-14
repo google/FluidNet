@@ -17,7 +17,7 @@ close all; clearvars; clc;
 % This script is just to sanity check Manta data.
 % First you need to create a data.mat file by running cnn_fluids.lua and
 % calling:
-% >> _tr:saveSampleToMatlab("utils/data.mat", 1, 1)
+% >> _tr:saveSampleToMatlab(_conf, "utils/data.mat", 1, 1)
 
 load('data.mat');
 

@@ -448,25 +448,3 @@ function torch.FPROPImage(conf, mconf, data, model, criterion, imgList)
   return err, pred, batchCPU, batchGPU
 end
 
-function torch.FPROPImageToDisk(conf, mconf, data, model, criterion, imgList, 
-                                filenamePrefix)
-  local oldBatchSize = conf.batchSize
-  conf.batchSize = #imgList
-  local batchCPU, batchGPU = data:visualizeBatch(conf, mconf, imgList, 1, true,
-                                                 "_input_" .. filenamePrefix)
-  conf.batchSize = oldBatchSize
-  local input = torch.getModelInput(batchGPU)
-  local target = torch.getModelTarget(batchGPU)
-  local pred = model:forward(input)
-  local err = criterion:forward(pred, target)
-
-  local outputData = {
-      p = pred[1],
-      U = pred[2],
-      geom = batchGPU.geom
-  }
-  data:_visualizeBatchData(outputData, 'predicted output', 1, true,
-                           '_predicted_' ..filenamePrefix, conf, mconf)
-  return err, pred, batchCPU, batchGPU
-end
-

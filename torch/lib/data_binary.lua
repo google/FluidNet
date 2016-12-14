@@ -33,7 +33,6 @@ local ZFP_ACCURACY = 1e-5
 local DIV_THRESHOLD = 100  -- Relaxed threshold.
 
 -- Helper function to load in and perform assertions on a run timestep file.
--- used to fill in self.runs[i].data[] tables
 -- This is a little naughty. Dump tfluids in the tfluids namespace so it can
 -- be used externally.
 -- @param bWidth: How much of the border to remove.
@@ -82,24 +81,14 @@ function tfluids.loadFile(fn, bWidth)
   return time, p, Ux, Uy, Uz, geom,  minVal
 end
 
---[[
--- Test for the above
-time, p, Ux, Uy, Uz, geom, minVal = tfluids.loadFile('../data/409_frames/001.bin')
---]]
-
 function DataBinary:__init(conf, prefix)
   -- Load the processed data.
-  self.srcDir = conf.srcDir
-  self.dataset = conf.dataset
+  self.dataDir = conf.dataDir  -- Just for reference
+  self.dataset = conf.dataset  -- Just for reference
   self.prefix = prefix
-  self.dir = self.srcDir .. '/' .. conf.dataset .. '/' .. prefix .. '/'
-  local runDirs = torch.ls(self.dir)
-  assert(#runDirs > 0, "couldn't find any run directories!" ..
-         " Looking at " .. self.dir)
-
-  for i = 1, #runDirs do
-    runDirs[i] = self.dir .. '/' .. runDirs[i] .. '/'
-  end
+  local baseDir = self:_getBaseDir(conf) .. '/'
+  local runDirs = torch.ls(baseDir)
+  assert(#runDirs > 0, "couldn't find any run directories in " .. baseDir)
 
   -- Create a network to calculate divergence of the set (see comment below).
   local divNet = nn.VelocityDivergence()
@@ -107,19 +96,17 @@ function DataBinary:__init(conf, prefix)
   -- Since the flat files array will include runs from multiple simulations, we
   -- need a list of valid frame pairs (to avoid trying to predict the transition
   -- between the last frame in one run and the first in another).
-  self.runs = {}
-  self.runDirs = {}
+  self.runs = {}  -- Not necessarily the entire set (we may remove some).
   self.minValue = math.huge
   for i = 1, #runDirs do
     torch.progress(i, #runDirs)
-    local files = torch.ls(runDirs[i] .. '*[0-9].bin')
-    local divFiles = torch.ls(runDirs[i] .. '*[0-9]_divergent.bin')
+    local runDir = self:_getBaseDir(conf) .. '/' .. runDirs[i] .. '/'
+    local files = torch.ls(runDir .. '*[0-9].bin')
+    local divFiles = torch.ls(runDir .. '*[0-9]_divergent.bin')
     
     assert(#files == #divFiles,
            "Main file count not equal to divergence file count")
-
-    assert(#files > conf.ignoreFrames, 'Not enough files in sub-dir ' ..
-      runDirs[i])
+    assert(#files > conf.ignoreFrames, 'Not enough files in sub-dir ' .. runDir)
 
     -- Ignore the first n frames.
     local runFiles = {}
@@ -202,19 +189,18 @@ function DataBinary:__init(conf, prefix)
       -- data on disk and read it back in on demand. This then means we'll
       -- need an asynchronous mechanism for loading data to hide the load
       -- latency.
-      data = self:_cacheDataToDisk(data, runDirs[i])
+      self:_cacheDataToDisk(data, conf, runDirs[i])
+      data = nil  -- No longer need it (it's cached on disk).
 
       self.runs[#self.runs + 1] = {
-        data = data,
+        dir = runDirs[i],
         ntimesteps = #runFiles,
         xdim = xdim,
         ydim = ydim,
         zdim = zdim
       }
-      self.runDirs[#self.runDirs + 1] = runDirs[i]
     end
   end
-  self.nruns = #self.runs
   runDirs = nil  -- Full set no longer needed.
 
   -- Check that the size of each run is the same.
@@ -231,7 +217,7 @@ function DataBinary:__init(conf, prefix)
 
   -- Create an explicit list of trainable frames.
   self.samples = {}
-  for r = 1, self.nruns do
+  for r = 1, #self.runs do
     for f = 1, self.runs[r].ntimesteps  do
       self.samples[#self.samples + 1] = {r, f}
     end
@@ -239,7 +225,21 @@ function DataBinary:__init(conf, prefix)
   self.samples = torch.LongTensor(self.samples)
 end
 
-function DataBinary:_cacheDataToDisk(data, dir)
+function DataBinary:_getBaseDir(conf)
+  -- Sanity check the dataset name (note: the dataDir might have changed).
+  assert(conf.dataset == self.dataset,
+         'trying to get data from the wrong dataset')
+  return conf.dataDir .. '/' .. conf.dataset .. '/' .. self.prefix .. '/'
+end
+
+-- Note: runDir is typically self.runs[irun].dir
+function DataBinary:_getCachePath(conf, runDir, iframe)
+  local dir = self:_getBaseDir(conf) .. '/' .. runDir .. '/'
+  local fn = string.format('frame_cache_%06d', iframe)
+  return dir .. fn
+end
+
+function DataBinary:_cacheDataToDisk(data, conf, runDir)
   -- The function will take in a table of tensors and an output directory
   -- and store the result on disk.
 
@@ -255,7 +255,6 @@ function DataBinary:_cacheDataToDisk(data, dir)
   end
 
   -- Now store each frame on disk in a separate file.
-  local cacheFns = {}  -- Basically just headers to each file on disk.
   for iframe = 1, nframes do
     local frameData = {}
     for key, value in pairs(data) do
@@ -271,18 +270,15 @@ function DataBinary:_cacheDataToDisk(data, dir)
       end
       frameData[key] = v
     end
-    local fn = string.format('%s/frame_cache_%06d', dir, iframe)
-    torch.save(fn, frameData)
-    cacheFns[iframe] = fn
+    torch.save(self:_getCachePath(conf, runDir, iframe), frameData)
   end
-  cacheFns = torch.stringTableToCharTensor(cacheFns)
   return cacheFns
 end
 
-function DataBinary:_loadDiskCache(irun, iframe)
+function DataBinary:_loadDiskCache(conf, irun, iframe)
   assert(irun <= #self.runs and irun >= 1)
   assert(iframe <= self.runs[irun].ntimesteps and iframe >= 1)
-  local fn = torch.charTensorToString(self.runs[irun].data[iframe])
+  local fn = self:_getCachePath(conf, self.runs[irun].dir, iframe)
   local data = torch.load(fn)
   for key, value in pairs(data) do
     if torch.type(value) == 'torch.ZFPTensor' then
@@ -293,15 +289,12 @@ function DataBinary:_loadDiskCache(irun, iframe)
 end
 
 -- Abstract away getting data from however we store it.
--- self.runs are the tr/xxx directories.
--- self.runs[i].data are the tr/i/xxx.bin files (the sim timesteps/data
--- themselves).
-function DataBinary:getSample(irun, iframe)
+function DataBinary:getSample(conf, irun, iframe)
   assert(irun <= #self.runs and irun >= 1, 'getSample: irun out of bounds!')
   assert(iframe <= self.runs[irun].ntimesteps and iframe >= 1,
     'getSample: iframe out of bounds!')
 
-  local data = self:_loadDiskCache(irun, iframe)
+  local data = self:_loadDiskCache(conf, irun, iframe)
 
   local p = data.p
   local pDiv = data.pDiv
@@ -319,9 +312,9 @@ function DataBinary:getSample(irun, iframe)
   return p, Ux, Uy, Uz, geom, pDiv, UxDiv, UyDiv, UzDiv
 end
 
-function DataBinary:saveSampleToMatlab(filename, irun, iframe)
+function DataBinary:saveSampleToMatlab(conf, filename, irun, iframe)
   local p, Ux, Uy, Uz, geom, pDiv, UxDiv, UyDiv, UzDiv =
-      self:getSample(irun, iframe)
+      self:getSample(conf, irun, iframe)
   local data = {p = p, Ux = Ux, Uy = Uy, Uz = Uz, geom = geom,
                 pDiv = pDiv, UxDiv = UxDiv, UyDiv = UyDiv, UzDiv = UzDiv}
   for key, value in pairs(data) do
@@ -333,13 +326,13 @@ end
 
 -- @param, irun: index of the simulation run you want to visualize.
 -- @param, depth: <OPTIONAL> for 3D datasets, this is the z slice to visualize.
-function DataBinary:visualizeData(irun, depth)
+function DataBinary:visualizeData(conf, irun, depth)
   if irun ~= nil then
-    assert(irun >= 1 and irun <= self.nruns)
+    assert(irun >= 1 and irun <= #self.runs)
   else
-    irun = torch.random(1, self.nruns)
+    irun = torch.random(1, #self.runs)
   end
-  print('Run: ' .. irun .. ', dir = ' .. self.runDirs[irun])
+  print('Run: ' .. irun .. ', dir = ' .. self.runs[irun].dir)
   depth = depth or 1
 
   local ntimesteps = self.runs[irun].ntimesteps
@@ -359,7 +352,7 @@ function DataBinary:visualizeData(irun, depth)
 
   for i = 1, ntimesteps do
     local p, Ux, Uy, Uz, geom, pDiv, UxDiv, UyDiv, UzDiv =
-        self:getSample(irun, i)
+        self:getSample(conf, irun, i)
     data.geom[i]:copy(geom)
     data.p[i]:copy(p)
     data.U[i][1]:copy(Ux)
@@ -369,20 +362,15 @@ function DataBinary:visualizeData(irun, depth)
     end
   end
 
-  self:_visualizeBatchData(data, self.runDirs[irun], depth)
+  self:_visualizeBatchData(data, self.runs[irun].dir, depth)
 
   return data
 end
 
 -- Visualize the components of a concatenated tensor of (p, U, geom).
-function DataBinary:_visualizeBatchData(data, legend, depth, toDisk,
-                                        filenamePrefix, conf, mconf)
+function DataBinary:_visualizeBatchData(data, legend, depth)
   -- Check the input.
   assert(data.p ~= nil and data.geom ~= nil and data.U ~= nil)
-
-  if toDisk == nil then
-    toDisk = false
-  end
 
   legend = legend or ''
   depth = depth or 1
@@ -399,61 +387,28 @@ function DataBinary:_visualizeBatchData(data, legend, depth, toDisk,
   Uy = data.U[{{}, {2}}]:float():select(3, depth)
   geom = data.geom:float():select(3, depth)
 
-  if toDisk ~= true then
-    local scaleeach = false;
-    image.display{image = p, zoom = zoom, padding = 2, nrow = nrow,
-      legend = (legend .. ': p'), scaleeach = scaleeach}
-    if Ux ~= nil then
-    image.display{image = Ux, zoom = zoom, padding = 2, nrow = nrow,
-      legend = (legend .. ': Ux'), scaleeach = scaleeach}
-    end
-    if Uy ~= nil then
-    image.display{image = Uy, zoom = zoom, padding = 2, nrow = nrow,
-      legend = (legend .. ': Uy'), scaleeach = scaleeach}
-    end
-    if geom ~= nil then
-      image.display{image = geom, zoom = zoom, padding = 2, nrow = nrow,
-        legend = (legend .. ': geom'), scaleeach = scaleeach}
-    end
-    if Uz ~= nil then
-      image.display{image = Uz, zoom = zoom, padding = 2, nrow = nrow,
-        legend = (legend .. ': Uz'), scaleeach = scaleeach}
-    end
-  else
-    assert(conf ~= nil, "conf was not passed into function")
-    p = image.minmax{tensor = p}
-    p = torch.squeeze(p)
-    image.save(conf.imageDir .. "gpu_".. conf.gpu .."_epoch_" .. mconf.epoch ..
-               filenamePrefix .. "_p.png", p)
-    if Ux ~= nil then
-      Ux = image.minmax{tensor = Ux}
-      Ux = torch.squeeze(Ux)
-      image.save(conf.imageDir .. "gpu_".. conf.gpu .."_epoch_" ..
-                 mconf.epoch .. filenamePrefix .. "_Ux.png", Ux)
-    end
-    if Uy ~= nil then
-      Uy = image.minmax{tensor = Uy}
-      Uy = torch.squeeze(Uy)
-      image.save(conf.imageDir .. "gpu_".. conf.gpu .."_epoch_" ..
-                 mconf.epoch .. filenamePrefix .. "_Uy.png", Uy)
-    end
-    if geom ~= nil then
-      geom = image.minmax{tensor = geom}
-      geom = torch.squeeze(geom)
-      image.save(conf.imageDir .. "gpu_".. conf.gpu .."_epoch_" ..
-                 mconf.epoch .. filenamePrefix .. "_geom.png", geom)
-    end
-    if Uz ~= nil then
-      Uz = image.minmax{tensor = Uz}
-      Uz = torch.squeeze(Uz)
-      image.save(conf.imageDir .. "gpu_".. conf.gpu .."_epoch_" ..
-                 mconf.epoch .. filenamePrefix .. "_Uz.png", Uz)
-    end
+  local scaleeach = false;
+  image.display{image = p, zoom = zoom, padding = 2, nrow = nrow,
+    legend = (legend .. ': p'), scaleeach = scaleeach}
+  if Ux ~= nil then
+  image.display{image = Ux, zoom = zoom, padding = 2, nrow = nrow,
+    legend = (legend .. ': Ux'), scaleeach = scaleeach}
+  end
+  if Uy ~= nil then
+  image.display{image = Uy, zoom = zoom, padding = 2, nrow = nrow,
+    legend = (legend .. ': Uy'), scaleeach = scaleeach}
+  end
+  if geom ~= nil then
+    image.display{image = geom, zoom = zoom, padding = 2, nrow = nrow,
+      legend = (legend .. ': geom'), scaleeach = scaleeach}
+  end
+  if Uz ~= nil then
+    image.display{image = Uz, zoom = zoom, padding = 2, nrow = nrow,
+      legend = (legend .. ': Uz'), scaleeach = scaleeach}
   end
 end
 
-function DataBinary:visualizeBatch(conf, mconf, imgList, depth, toDisk,
-                                   filenamePrefix)
+function DataBinary:visualizeBatch(conf, mconf, imgList, depth)
   if imgList == nil then
     local shuffle = torch.randperm(self:nsamples())
     imgList = {}
@@ -463,32 +418,24 @@ function DataBinary:visualizeBatch(conf, mconf, imgList, depth, toDisk,
   end
   depth = depth or 1
 
-  if filenamePrefix == nil then
-    filenamePrefix = ''
-  end
-
   local batchCPU, batchGPU = self:AllocateBatchMemory(conf, mconf)
   local perturb = conf.trainPerturb.on
   local degRot, scale, transVPix, transUPix, flipX, flipY, flipZ =
     self:CreateBatch(batchCPU, batchGPU, conf, mconf, imgList, perturb)
 
-  if not toDisk then
-    print('    Image set:')  -- Don't print if this is used in the train loop.
-  end
+  print('    Image set:')  -- Don't print if this is used in the train loop.
   for i = 1, #imgList do
     local isample = imgList[i]
 
     local irun = self.samples[isample][1]
     local if1 = self.samples[isample][2]
     
-    if not toDisk then
-      print(string.format("    %d - sample %d: irun = %d, if1 = %d", i,
-                          imgList[i], irun, if1))
-      print(string.format(
-          "      degRot = %.1f, scale = %.3f, trans_uv = [%.1f, %.1f], " ..
-          "flip = (%d, %d, %d)", degRot[i], scale[i], transUPix[i],
-          transVPix[i], flipX[i], flipY[i], flipZ[i]))
-    end
+    print(string.format("    %d - sample %d: irun = %d, if1 = %d", i,
+                        imgList[i], irun, if1))
+    print(string.format(
+        "      degRot = %.1f, scale = %.3f, trans_uv = [%.1f, %.1f], " ..
+        "flip = (%d, %d, %d)", degRot[i], scale[i], transUPix[i],
+        transVPix[i], flipX[i], flipY[i], flipZ[i]))
   end
 
   local range = {1, #imgList}
@@ -501,16 +448,14 @@ function DataBinary:visualizeBatch(conf, mconf, imgList, depth, toDisk,
       U = batchGPU.UDiv,
       geom = batchGPU.geom
   }
-  self:_visualizeBatchData(inputData, 'input', depth, toDisk, filenamePrefix,
-                           conf, mconf)
+  self:_visualizeBatchData(inputData, 'input', depth)
 
   local outputData = {
       p = batchGPU.pTarget,
       U = batchGPU.UTarget,
       geom = batchGPU.geom
   }
-  self:_visualizeBatchData(outputData, 'target', depth, toDisk,
-                           '_target_' .. filenamePrefix, conf, mconf)
+  self:_visualizeBatchData(outputData, 'target', depth)
 
   return batchCPU, batchGPU
 end
@@ -641,7 +586,7 @@ function DataBinary:CreateBatch(batchCPU, batchGPU, conf, mconf, imgList,
 
     -- Copy the input channels
     local p1, Ux1, Uy1, Uz1, geom1, p1Div, Ux1Div, Uy1Div, Uz1Div =
-        self:getSample(irun, if1)
+        self:getSample(conf, irun, if1)
     pDiv:copy(p1Div)
     geom:copy(geom1)
     UDiv[1]:copy(Ux1Div)

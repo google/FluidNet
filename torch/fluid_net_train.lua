@@ -68,12 +68,11 @@ end
 torch.makeGlobal('_mconf', mconf)
 torch.makeGlobal('_model', model)
 
-if conf.visualize then
-  tr:visualizeData()
-  --tr:visualizeData(1) -- visualize a particular run
-  -- showFiltersOfType(model, 'nn.SpatialConvolutionMM',
-  -- 'before training', true)
-end 
+--[[
+-- Funcs to visualize the data.
+_tr:visualizeData(_conf)  -- visualize a random run.
+_tr:visualizeData(_conf, 1) -- visualize a particular run.
+--]]
 
 -- ********************* Define Criterion (loss) function **********************
 print '==> defining loss function'
@@ -135,10 +134,10 @@ else
 end
 
 -- ************************ a Visualize Training Batch *************************
-if conf.visualize then
-  --tr:visualizeBatch(conf, mconf)
-  --tr:visualizeBatch(conf, mconf, {1})  -- Explicitly define batch set -- the last parameter is the z-depth in a 3d set
-end
+--[[
+_tr:visualizeBatch(_conf, _mconf)  -- Visualize random batch.
+_tr:visualizeBatch(_conf, _mconf, {1})  -- Explicitly define batch samples.
+--]]
 
 -- ************************ Profile the model for the paper ********************
 if conf.profileFPROPTime > 0 then
@@ -227,17 +226,6 @@ if conf.train then
         trPerf.loss, trPerf.pLoss, trPerf.uLoss, trPerf.divLoss,
         trPerf.longTermDivLoss, tePerf.loss, tePerf.pLoss, tePerf.uLoss,
         tePerf.divLoss, tePerf.longTermDivLoss}
-
-    -- Write image to disk.
-    local samplenum = math.max(tr:nsamples() / 2,1)
-    local err, pred, batchCPU, batchGPU =
-        torch.FPROPImageToDisk(conf, mconf, tr, model, criterion,
-                               {samplenum}, '')
-    local convStr = 'nn.SpatialConvolution'
-    if #model:findModules('cudnn.SpaitalConvolution') > 0 then
-      convStr = 'cudnn.SpaitalConvolution'
-    end
-    saveFiltersToImage(model, convStr, '', true, 64, conf, mconf)
   end
 
   if conf.profile then
@@ -248,15 +236,11 @@ end
 
 -- ********************* Visualize some inputs and outputs *********************
 -- Create a random batch, FPROP using it and visualize the results
-if conf.visualize then
-    local samplenum = math.max(tr:nsamples() / 2,1)
-    local err, pred, batchCPU, batchGPU =
-        torch.FPROPImage(conf, mconf, tr, model, criterion, {samplenum})
-    
-    -- showFiltersOfType(model, 'nn.SpatialConvolutionMM',
-    --                   'after training', true)
-    -- displayWeightsAndGradients(model)
-end
+--[[
+local samplenum = math.max(tr:nsamples() / 2,1)
+local err, pred, batchCPU, batchGPU =
+    torch.FPROPImage(conf, mconf, tr, model, criterion, {samplenum})
+--]]
 
 -- *************************** CALCULATE STATISTICS ****************************
 -- First do a fast run-through of the test-set to measure test-set crit perf.

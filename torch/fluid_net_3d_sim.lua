@@ -113,11 +113,11 @@ tfluids.createPlumeBCs(batchGPU, color, uScale, rad)
 dofile("lib/include.lua")
 tr = torch.load("../data/datasets/preprocessed_output_current_3d_geom_tr.bin")
 UMax = {}
-for r = 1, tr.nruns do
-  torch.progress(r, tr.nruns)
+for r = 1, #tr.runs do
+  torch.progress(r, #tr.runs)
   for i = 1, tr.runs[r].ntimesteps do
     local curUMax = 0
-    local p, Ux, Uy, Uz = tr:getSample(r, i)
+    local p, Ux, Uy, Uz = tr:getSample(conf, r, i)
     curUMax = math.max(curUMax, Ux:abs():max())
     curUMax = math.max(curUMax, Uy:abs():max())
     curUMax = math.max(curUMax, Uz:abs():max())
