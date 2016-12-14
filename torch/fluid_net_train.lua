@@ -62,8 +62,8 @@ else
   model, mconf = torch.defineModel(conf, tr) -- in model.lua
   model:cuda()
   -- Visualize the model to file.
-  graph.dot(model.fg, 'Forward Graph', conf.modelDirname .. '_fg')
-  graph.dot(model.bg, 'Backward Graph', conf.modelDirname .. '_bg')
+  -- graph.dot(model.fg, 'Forward Graph', conf.modelDirname .. '_fg')
+  -- graph.dot(model.bg, 'Backward Graph', conf.modelDirname .. '_bg')
 end
 torch.makeGlobal('_mconf', mconf)
 torch.makeGlobal('_model', model)

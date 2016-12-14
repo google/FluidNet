@@ -84,12 +84,9 @@ dofile('lib/parse_args.lua')
 dofile('lib/modules/spatial_subtractive_normalization_batch.lua')
 dofile('lib/modules/spatial_divisive_normalization_batch.lua')
 dofile('lib/modules/spatial_contrastive_normalization_batch.lua')
-dofile('lib/modules/fluid_l1_criterion.lua')
-dofile('lib/modules/fluid_l2_criterion.lua')
 dofile('lib/modules/lerp_criterion.lua')
 dofile('lib/modules/select_fluid_input.lua')
 dofile('lib/debug_tools.lua')
-dofile('lib/modules/debug_flow.lua')
 dofile('lib/modules/spatial_divergence.lua')
 dofile('lib/modules/spatial_finite_elements.lua')
 dofile('lib/modules/volumetric_divergence.lua')
@@ -119,4 +116,4 @@ if math.mod == nil then
   math.mod = math.fmod
 end
 
-require 'strict'
+torch.loadPackageSafe('strict')  -- Must come last
