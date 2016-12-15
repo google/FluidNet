@@ -1033,6 +1033,8 @@ static int tfluids_CudaMain_calcVelocityDivergenceBackward(lua_State *L) {
 
 // solveLinearSystemPCG lua entry point.
 static int tfluids_CudaMain_solveLinearSystemPCG(lua_State *L) {
+  init_cusparse();  // No op if already initialized.
+/*
   THCState* state = cutorch_getstate(L);
   THCudaTensor* delta_u = reinterpret_cast<THCudaTensor*>(
       luaT_checkudata(L, 1, "torch.CudaTensor"));
@@ -1069,14 +1071,12 @@ static int tfluids_CudaMain_solveLinearSystemPCG(lua_State *L) {
   const float* ptr_geom = dev_geom.data();
   const float* ptr_u = dev_u.data();
 
-  init_cusparse();  // No op if already initialized.
-
   // MAKE SURE THE cuSPARSE LIBRARY IS BOUND CORRECTLY. DONOTSUBMIT.
   cusparseMatDescr_t descr = 0;  // DONOTSUBMIT
   cusparseCreateMatDescr(&descr);  // DONOTSUBMIT
   cusparseSetMatType(descr, CUSPARSE_MATRIX_TYPE_GENERAL);  // DONOTSUBMIT
   cusparseSetMatIndexBase(descr, CUSPARSE_INDEX_BASE_ONE);  // DONOTSUBMIT
-
+*/
   luaL_error(L, "ERROR: solveLinearSystemPCG not implemented");  // DONOTSUBMIT
  
   return 0;

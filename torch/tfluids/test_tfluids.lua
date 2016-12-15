@@ -257,6 +257,7 @@ function test.calcVelocityUpdateCUDA()
   end
 end
 
+--[[
 function test.solveLinearSystemPCGCUDA()
   local batchSize = torch.random(1, 3)
   local w = torch.random(32, 64)
@@ -283,6 +284,7 @@ function test.solveLinearSystemPCGCUDA()
     -- TODO(kris): Check the output.
   end
 end
+--]]
 
 function test.calcVelocityDivergenceCUDA()
   -- NOTE: The forward and backward function tests are in:

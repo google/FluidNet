@@ -23,7 +23,7 @@ dofile('lib/load_package_safe.lua')
 local cutorch = torch.loadPackageSafe('cutorch')
 torch.loadPackageSafe('cunn')
 require 'image'
-require 'optim'
+local optim = require('optim')
 require 'gnuplot'
 local cudnn = torch.loadPackageSafe('cudnn')
 if cudnn ~= nil then
@@ -102,6 +102,12 @@ dofile('lib/modules/spatial_convolution_upsample.lua')
 dofile('lib/modules/volumetric_convolution_upsample.lua')
 dofile('lib/modules/mse_si_criterion.lua')
 dofile('lib/calc_stats.lua')
+if optim.adam == nil then
+  dofile('lib/adam.lua')
+end
+if optim.rmsprop == nil then
+  dofile('lib/rmsprop.lua')
+end
 
 torch.setdefaulttensortype('torch.FloatTensor')
 torch.setnumthreads(8)

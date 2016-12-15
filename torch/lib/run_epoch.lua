@@ -14,6 +14,7 @@
 
 local sys = require('sys')
 local tfluids = require('tfluids')
+local mattorch = torch.loadPackageSafe('mattorch')
 
 -- dofile('lib/load_package_safe.lua')
 

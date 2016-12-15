@@ -106,27 +106,9 @@ if mconf.optimizationMethod == 'sgd' then
 elseif mconf.optimizationMethod == 'adam' then
   print("    Using ADAM...")
   optimMethod = optim.adam
-elseif mconf.optimizationMethod == 'adagrad' then
-  print("    Using ADAGRAD...")
-  optimMethod = optim.adagrad
-elseif mconf.optimizationMethod == 'adamax' then
-  print("    Using ADAMAX...")
-  optimMethod = optim.adamax
-elseif mconf.optimizationMethod == 'adadelta' then
-  print("    Using ADADELTA...")
-  optimMethod = optim.adadelta
-elseif mconf.optimizationMethod == 'cg' then
-  print("    Using Conjugate Gradient...")
-  optimMethod = optim.cg
 elseif mconf.optimizationMethod == 'rmsprop' then
   print("    Using rmsprop...")
   optimMethod = optim.rmsprop
-elseif mconf.optimizationMethod == 'rprop' then
-  print("    Using rprop...")
-  optimMethod = optim.rprop
-elseif mconf.optimizationMethod == 'lbfgs' then
-  print("    Using lbfgs...")
-  optimMethod = optim.lbfgs
 else
   print("    Using SGD...")
   optimMethod = optim.sgd

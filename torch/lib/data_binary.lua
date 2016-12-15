@@ -31,13 +31,14 @@ local DataBinary, parent = torch.class('torch.DataBinary')
 local COMPRESS_DATA_ON_DISK = false
 local ZFP_ACCURACY = 1e-5
 local DIV_THRESHOLD = 100  -- Relaxed threshold.
+local DEFAULT_BORDER_WIDTH = 1
 
 -- Helper function to load in and perform assertions on a run timestep file.
 -- This is a little naughty. Dump tfluids in the tfluids namespace so it can
 -- be used externally.
 -- @param bWidth: How much of the border to remove.
 function tfluids.loadFile(fn, bWidth)
-  bWidth = bWidth or 1
+  bWidth = bWidth or DEFAULT_BORDER_WIDTH
   assert(paths.filep(fn), "couldn't find ".. fn)
   local file = torch.DiskFile(fn, 'r')
   file:binary()
@@ -272,7 +273,6 @@ function DataBinary:_cacheDataToDisk(data, conf, runDir)
     end
     torch.save(self:_getCachePath(conf, runDir, iframe), frameData)
   end
-  return cacheFns
 end
 
 function DataBinary:_loadDiskCache(conf, irun, iframe)

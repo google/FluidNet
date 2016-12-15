@@ -22,19 +22,21 @@
 #include "generic/vec3.cc"
 #include "generic/calc_line_trace.cc"
 
-#if defined (__APPLE__) || defined (OSX)
+#ifdef BUILD_GL_FUNCS
+  #if defined (__APPLE__) || defined (OSX)
     #include <OpenGL/gl.h>
     #include <OpenGL/glu.h>
     #include <OpenGL/glext.h>
-#else
+  #else
     #include <GL/gl.h>
-#endif
+  #endif
 
-#ifndef GLUT_API_VERSION
-  #if defined(macintosh) || defined(__APPLE__) || defined(OSX)
-    #include <GLUT/glut.h>
-  #elif defined (__linux__) || defined (UNIX) || defined(WIN32) || defined(_WIN32)
-    #include "GL/glut.h"
+  #ifndef GLUT_API_VERSION
+    #if defined(macintosh) || defined(__APPLE__) || defined(OSX)
+      #include <GLUT/glut.h>
+    #elif defined (__linux__) || defined (UNIX) || defined(WIN32) || defined(_WIN32)
+      #include "GL/glut.h"
+    #endif
   #endif
 #endif
 
@@ -1278,6 +1280,7 @@ static int tfluids_(Main_interpField)(lua_State *L) {
 }
 
 static int tfluids_(Main_drawVelocityField)(lua_State *L) {
+#ifdef BUILD_GL_FUNCS
   THTensor* u =
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 1, torch_Tensor));
 
@@ -1340,10 +1343,14 @@ static int tfluids_(Main_drawVelocityField)(lua_State *L) {
     }
   }
   glEnd();
+#else
+  luaL_error(L, "tfluids compiled without preprocessor def BUILD_GL_FUNCS.");
+#endif
   return 0;
 }
 
 static int tfluids_(Main_loadTensorTexture)(lua_State *L) {
+#ifdef BUILD_GL_FUNCS
   THTensor* im_tensor =
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 1, torch_Tensor));
   if (im_tensor->nDimension != 2 && im_tensor->nDimension != 3) {
@@ -1416,6 +1423,9 @@ static int tfluids_(Main_loadTensorTexture)(lua_State *L) {
   const GLenum type = GL_FLOAT;
   glTexImage2D(GL_TEXTURE_2D, level, internalformat, w, h, border,
                format, type, fdata.get());
+#else
+  luaL_error(L, "tfluids compiled without preprocessor def BUILD_GL_FUNCS.");
+#endif
   return 0;
 }
 
