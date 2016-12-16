@@ -278,56 +278,33 @@ function tfluids.buoyancyBatch(dt, scalar, U, geom, scale)
   end
 end
 
--- NOTE: simulate assumes that batchGPU holds the fluid state both before and
--- after the function returns. batchCPU is used for temporary memory.
 -- @param conf: config table.
 -- @param mconf: model config table.
--- @param batchCPU: CPU batch data (used as temp memory).
--- @param batchGPU: GPU batch data (holds simulation state before and after
+-- @param batch: CPU or GPU batch data (holds simulation state before and after
 -- simulate is called).
 -- @param model: The pressure model.
 -- @param outputDiv: OPTIONAL. Return just before solving for pressure (i.e.
 -- leave the state as UDiv and pDiv (before subtracting divergence).
-function tfluids.simulate(conf, mconf, batchCPU, batchGPU, model, outputDiv)
+function tfluids.simulate(conf, mconf, batch, model, outputDiv)
   if outputDiv == nil then
     outputDiv = false
   end
 
-  local p, U, geom, density =
-      tfluids.getPUGeomDensityReference(batchGPU)
-  local pCPU, UCPU, geomCPU, densityCPU =
-      tfluids.getPUGeomDensityReference(batchCPU)
-
-  -- We Perform advection on the CPU.
-  -- TODO(tompson): Move all advection code to the GPU to avoid this slow
-  -- set of syncs and slow advection routine... This is currently the bottleneck
-  -- of our system :-(
-  UCPU:copy(U)  -- GPU --> CPU Sync.
-  geomCPU:copy(geom)  -- GPU --> CPU Sync.
-  if density ~= nil then
-    densityCPU:copy(density)  -- GPU --> CPU Sync
-  end
+  local p, U, geom, density = tfluids.getPUGeomDensityReference(batch)
 
   -- First advect all scalar fields (density, temperature, etc).
   if density ~= nil then
-    advectScalarBatch(mconf.dt, densityCPU, UCPU, geomCPU,
-                      mconf.advectionMethod)
+    advectScalarBatch(mconf.dt, density, U, geom, mconf.advectionMethod)
   end
 
   -- Now self-advect velocity (must be advected last).
-  advectVelocityBatch(mconf.dt, UCPU, geomCPU, mconf.advectionMethod)
-
-  -- Finally, sync data back to the GPU
-  if density ~= nil then
-    density:copy(densityCPU)
-  end
-  U:copy(UCPU)  -- CPU --> GPU Sync.
-  setBoundaryConditionsBatch(batchGPU, mconf.bndType)
+  advectVelocityBatch(mconf.dt, U, geom, mconf.advectionMethod)
+  setBoundaryConditionsBatch(batch, mconf.bndType)
 
   -- Add external forces (buoyancy and gravity).
   if density ~= nil and mconf.buoyancyScale > 0 then
     tfluids.buoyancyBatch(mconf.dt, density, U, geom, mconf.buoyancyScale)
-    setBoundaryConditionsBatch(batchGPU, mconf.bndType)
+    setBoundaryConditionsBatch(batch, mconf.bndType)
   end
 
   -- TODO(tompson,kris): Add support for gravity (easy to do, just add (-dt) * g
@@ -336,7 +313,7 @@ function tfluids.simulate(conf, mconf, batchCPU, batchGPU, model, outputDiv)
   -- Add vorticity confinement.
   if mconf.vorticityConfinementAmp > 0 then
     vorticityConfinementBatch(mconf.dt, mconf.vorticityConfinementAmp, U, geom)
-    setBoundaryConditionsBatch(batchGPU, mconf.bndType)
+    setBoundaryConditionsBatch(batch, mconf.bndType)
   end
 
   if outputDiv then
@@ -346,14 +323,14 @@ function tfluids.simulate(conf, mconf, batchCPU, batchGPU, model, outputDiv)
   end
 
   -- FPROP the model to perform the pressure projection & velocity calculation.
-  local modelOutput = model:forward(torch.getModelInput(batchGPU))
+  local modelOutput = model:forward(torch.getModelInput(batch))
 
   -- Copy the GPU output back to the CPU (velocity and pressure).
   local pPred, UPred = torch.parseModelOutput(modelOutput)
   p:copy(pPred)
   U:copy(UPred)
 
-  setBoundaryConditionsBatch(batchGPU, mconf.bndType)
+  setBoundaryConditionsBatch(batch, mconf.bndType)
 
   -- Finally, clamp the velocity so that even if the sim blows up it wont blow
   -- up to inf (which causes some of our kernels to hang infinitely).

@@ -101,7 +101,8 @@ static inline real tfluids_(Main_GetInterpValue)(
   // Make sure we're not against the grid boundary or beyond it.
   // This is a conservative test (i.e. we test if position is on or beyond it).
   if (IsOutOfDomainReal(pos, dims)) {
-    printf("ERROR: GetInterpValue called on a point out of the domain!\n");
+    printf("ERROR: GetInterpValue called on a point (%f, %f, %f) out of the "
+           "domain!\n", pos.x, pos.y, pos.z);
     exit(-1);
   }
 
@@ -398,7 +399,7 @@ static void tfluids_(Main_vorticityConfinement)(
     printf("Error: vorticityConfinement x and y dim are too small.\n");
     exit(-1);
   }
-  if (!(!two_dim || dims.z > 2)) {
+  if (!two_dim && dims.z <= 2) {
     printf("Error: vorticityConfinement z dim is too small.\n");
     exit(-1);
   }

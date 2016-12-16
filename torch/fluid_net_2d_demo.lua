@@ -321,7 +321,7 @@ function tfluids.displayFunc()
   do
     -- Update data to next time step.
     local t0 = sys.clock()
-    tfluids.simulate(conf, mconf, batchCPU, batchGPU, model)
+    tfluids.simulate(conf, mconf, batchGPU, model)
     -- So that our profiling is correct we need to flush the GPU buffer, however
     -- this could be at the cost of total render time.
     cutorch.synchronize()
@@ -609,7 +609,7 @@ function tfluids.startOpenGL(output)
   -- Do a simulate step JUST before running the loop. Once we enter the GL loop
   -- any errors will not have a stack trace, so simulating one loop here helps
   -- with debugging.
-  tfluids.simulate(conf, mconf, batchCPU, batchGPU, model)
+  tfluids.simulate(conf, mconf, batchGPU, model)
 
   glut.MainLoop()
 end

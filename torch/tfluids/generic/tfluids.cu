@@ -24,6 +24,7 @@
 #include "THCDeviceTensorUtils.cuh"
 #include "THCDeviceUtils.cuh"
 #include "THCReduceApplyUtils.cuh"
+#include "quadrants.h"  // typedef enum Quadrants
 
 // This is REALLY ugly. But unfortunately cutorch_getstate() in
 // cutorch/torch/util.h is not exposed externally. We could call
@@ -50,6 +51,101 @@ static void init_cusparse() {
     }
   }
 }
+
+//******************************************************************************
+// HELPER METHODS
+//******************************************************************************
+
+// We never want positions to go exactly to the border or exactly to the edge
+// of an occupied piece of geometry. Therefore all rays will be truncated by
+// a very small amount (hit_margin).
+static const float hit_margin = 1e-5f;
+static const float max_float = std::numeric_limits<float>::max();
+
+// Get the integer index of the current voxel.
+// Excerpt of comment from tfluids.cc:
+// ... the (-0.5, 0, 0) position is the LEFT face of the first cell. Likewise
+// (xdim - 0.5, ydim - 0.5, zdim - 0.5) is the upper bound of the grid (right
+// at the corner). ...
+__device__ __forceinline__ void GetPixelCenter(
+    const float pos[3], int* ix, int* iy, int* iz) {
+  *ix = (int)(pos[0] + 0.5f);
+  *iy = (int)(pos[1] + 0.5f);
+  *iz = (int)(pos[2] + 0.5f);
+}
+
+// geom is just used here as a reference to pass in domain size.
+__device__ __forceinline__ bool IsOutOfDomain(
+    const int i, const int j, const int k,
+    const THCDeviceTensor<float, 3>& geom) {
+  const int dimx = geom.getSize(2);
+  const int dimy = geom.getSize(1);
+  const int dimz = geom.getSize(0);
+  return i < 0 || i >= dimx || j < 0 || j >= dimy || k < 0 || k >= dimz;
+}
+
+// geom is just used here as a reference to pass in domain size.
+__device__ __forceinline__ bool IsOutOfDomainReal(
+    const float pos[3], const THCDeviceTensor<float, 3>& geom) {
+  const int dimx = geom.getSize(2);
+  const int dimy = geom.getSize(1);
+  const int dimz = geom.getSize(0);
+  return (pos[0] <= -0.5f ||  // LHS of grid cell.
+          pos[0] >= ((float)dimx - 0.5f) ||  // RHS of grid cell.
+          pos[1] <= -0.5f ||
+          pos[1] >= ((float)dimy - 0.5f) ||
+          pos[2] <= -0.5f ||
+          pos[2] >= ((float)dimz - 0.5f));
+}
+
+__device__ __forceinline__ bool IsBlockedCell(
+    const THCDeviceTensor<float, 3>& geom, int i, int j, int k) {
+  // Returns true if the cell is blocked.
+  // Shouldn't be called on point outside the domain.
+  assert(!tfluids_(IsOutOfDomain)(i, j, k, geom));
+  return geom[k][j][i] == 1.0f;
+}
+
+__device__ __forceinline__ bool IsBlockedCellReal(
+    const THCDeviceTensor<float, 3>& geom, const float pos[3]) {
+  int ix, iy, iz;
+  GetPixelCenter(pos, &ix, &iy, &iz);
+  return IsBlockedCell(geom, ix, iy, iz);
+}
+
+__device__ __forceinline__ void ClampToDomain(
+    const THCDeviceTensor<float, 3>& geom, int* ix, int* iy, int* iz) {
+  const int dimx = geom.getSize(2);
+  const int dimy = geom.getSize(1);
+  const int dimz = geom.getSize(0);
+  *ix = max(min(*ix, dimx - 1), 0);
+  *iy = max(min(*iy, dimy - 1), 0);
+  *iz = max(min(*iz, dimz - 1), 0);
+}
+
+__device__ __forceinline__ void ClampToDomainReal(
+    float pos[3], const THCDeviceTensor<float, 3>& geom) {
+  const float dimx = (float)geom.getSize(2);
+  const float dimy = (float)geom.getSize(1);
+  const float dimz = (float)geom.getSize(0);
+  const float half = 0.5f;
+  pos[0] = min(max(pos[0], -half + hit_margin), dimx - half - hit_margin);
+  pos[1] = min(max(pos[1], -half + hit_margin), dimy - half - hit_margin);
+  pos[2] = min(max(pos[2], -half + hit_margin), dimz - half - hit_margin);
+}
+
+__device__ __forceinline__ float length3(const float v[3]) {
+  const float length_sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+  if (length_sq > 1e-6f) {
+    return sqrt(length_sq);
+  } else {
+    return 0.0f;
+  }
+}
+
+//******************************************************************************
+// averageBorderCells
+//******************************************************************************
 
 // averageBorderCells CUDA kernel
 __global__ void kernel_averageBorderCells(
@@ -100,7 +196,7 @@ __global__ void kernel_averageBorderCells(
     }
   }
   if (count > 0) {
-    out[chan][z][y][x] = sum / static_cast<float>(count);
+    out[chan][z][y][x] = sum / (float)(count);
   } else {
     // No non-geom pixels found. Just copy over result.
     const float value = in[chan][z][y][x];
@@ -121,10 +217,10 @@ static int tfluids_CudaMain_averageBorderCells(lua_State *L) {
   if (in->nDimension != 4 || geom->nDimension != 3) {
     luaL_error(L, "Input tensor should be 4D and geom should be 3D");
   }
-  const int32_t nchan = in->size[0];
-  const int32_t zdim = in->size[1];
-  const int32_t ydim = in->size[2];
-  const int32_t xdim = in->size[3];
+  const int nchan = in->size[0];
+  const int zdim = in->size[1];
+  const int ydim = in->size[2];
+  const int xdim = in->size[3];
   const bool two_dim = zdim == 1;
 
   THCDeviceTensor<float, 4> dev_in = toDeviceTensor<float, 4>(state, in);
@@ -141,6 +237,10 @@ static int tfluids_CudaMain_averageBorderCells(lua_State *L) {
 
   return 0;
 }
+
+//******************************************************************************
+// setObstacleBCS
+//******************************************************************************
 
 // setObstacleBcs CUDA kernel
 __global__ void kernel_setObstacleBcs(
@@ -211,9 +311,9 @@ static int tfluids_CudaMain_setObstacleBcs(lua_State *L) {
     luaL_error(L, "Input tensor should be 4D and geom should be 3D");
   }
   const bool two_dim = U->size[0] == 2;
-  const int32_t zdim = U->size[1];
-  const int32_t ydim = U->size[2];
-  const int32_t xdim = U->size[3];
+  const int zdim = U->size[1];
+  const int ydim = U->size[2];
+  const int xdim = U->size[3];
   if (two_dim && zdim != 1) {
     luaL_error(L, "2D velocity field but zdim != 1");
   }
@@ -237,9 +337,14 @@ static int tfluids_CudaMain_setObstacleBcs(lua_State *L) {
   return 0;
 }
 
-__device__ void getCurl3D(const THCDeviceTensor<float, 4>& U, const int i,
-                          const int j, const int k, const int xdim,
-                          const int ydim, const int zdim, float curl[3]) {
+//******************************************************************************
+// vorticityConfinement
+//******************************************************************************
+
+__device__ __forceinline__ void getCurl3D(
+    const THCDeviceTensor<float, 4>& U, const int i,
+    const int j, const int k, const int xdim,
+    const int ydim, const int zdim, float curl[3]) {
   float dwdj, dudj;
   if (j == 0) {
     // Single sided diff (pos side).
@@ -290,8 +395,9 @@ __device__ void getCurl3D(const THCDeviceTensor<float, 4>& U, const int i,
   curl[2] = dvdi - dudj;
 }
 
-__device__ float getCurl2D(const THCDeviceTensor<float, 4>& U, const int i,
-                           const int j, const int xdim, const int ydim) {
+__device__ __forceinline__ float getCurl2D(
+    const THCDeviceTensor<float, 4>& U, const int i,
+    const int j, const int xdim, const int ydim) {
   float dvdi;
   const int k = 0;
   if (i == 0) {
@@ -447,8 +553,8 @@ __global__ void kernel_vorticityConfinement(
 static int tfluids_CudaMain_vorticityConfinement(lua_State *L) {
   THCState* state = cutorch_getstate(L);
 
-  const float dt = static_cast<float>(lua_tonumber(L, 1));
-  const float scale = static_cast<float>(lua_tonumber(L, 2));  
+  const float dt = (float)(lua_tonumber(L, 1));
+  const float scale = (float)(lua_tonumber(L, 2));  
   THCudaTensor* U = reinterpret_cast<THCudaTensor*>(
       luaT_checkudata(L, 3, "torch.CudaTensor"));
   THCudaTensor* geom = reinterpret_cast<THCudaTensor*>(
@@ -464,9 +570,9 @@ static int tfluids_CudaMain_vorticityConfinement(lua_State *L) {
   }
 
   bool two_dim = U->size[0] == 2;
-  const int32_t xdim = static_cast<int32_t>(geom->size[2]);
-  const int32_t ydim = static_cast<int32_t>(geom->size[1]);
-  const int32_t zdim = static_cast<int32_t>(geom->size[0]);
+  const int xdim = static_cast<int>(geom->size[2]);
+  const int ydim = static_cast<int>(geom->size[1]);
+  const int zdim = static_cast<int>(geom->size[0]);
 
   if (two_dim && curl->nDimension != 3) {
      luaL_error(L, "Bad curl size.");
@@ -514,6 +620,10 @@ static int tfluids_CudaMain_vorticityConfinement(lua_State *L) {
 
   return 0;
 }
+
+//******************************************************************************
+// calcVelocityUpdate
+//******************************************************************************
 
 // calcVelocityUpdate CUDA kernel.
 __global__ void kernel_calcVelocityUpdate(
@@ -635,11 +745,11 @@ static int tfluids_CudaMain_calcVelocityUpdate(lua_State *L) {
     luaL_error(L, "Incorrect dimensions. Expect delta_u: 5, p: 4, geom: 4.");
   }
 
-  const int32_t nbatch = delta_u->size[0];
-  const int32_t nuchan = delta_u->size[1];
-  const int32_t zdim = delta_u->size[2];
-  const int32_t ydim = delta_u->size[3];
-  const int32_t xdim = delta_u->size[4];
+  const int nbatch = delta_u->size[0];
+  const int nuchan = delta_u->size[1];
+  const int zdim = delta_u->size[2];
+  const int ydim = delta_u->size[3];
+  const int xdim = delta_u->size[4];
 
   THCDeviceTensor<float, 5> dev_delta_u =
       toDeviceTensor<float, 5>(state, delta_u);
@@ -660,6 +770,10 @@ static int tfluids_CudaMain_calcVelocityUpdate(lua_State *L) {
  
   return 0;
 }
+
+//******************************************************************************
+// calcVelocityUpdateBackward
+//******************************************************************************
 
 // calcVelocityUpdateBackward CUDA kernel.
 // TODO(tompson,kris): I'm sure these atomic add calls are slow! We should
@@ -770,11 +884,11 @@ static int tfluids_CudaMain_calcVelocityUpdateBackward(lua_State *L) {
   // we first need to zero it.
   THCudaTensor_zero(state, grad_p);
 
-  const int32_t nbatch = grad_p->size[0];
-  const int32_t zdim = grad_p->size[1];
-  const int32_t ydim = grad_p->size[2];
-  const int32_t xdim = grad_p->size[3];
-  const int32_t nuchan = grad_output->size[1];
+  const int nbatch = grad_p->size[0];
+  const int zdim = grad_p->size[1];
+  const int ydim = grad_p->size[2];
+  const int xdim = grad_p->size[3];
+  const int nuchan = grad_output->size[1];
 
   THCDeviceTensor<float, 5> dev_grad_output =
       toDeviceTensor<float, 5>(state, grad_output);
@@ -797,6 +911,10 @@ static int tfluids_CudaMain_calcVelocityUpdateBackward(lua_State *L) {
 
   return 0;
 }
+
+//******************************************************************************
+// calcVelocityDivergence
+//******************************************************************************
 
 // calcVelocityDivergence CUDA kernel.
 __global__ void kernel_calcVelocityDivergence(
@@ -825,10 +943,10 @@ __global__ void kernel_calcVelocityDivergence(
   const int size[3] = {xdim, ydim, zdim};
 
   // Now calculate the partial derivatives in each dimension.
-  for (int32_t dim = 0; dim < nuchan; dim ++) {
-    int32_t pos_p[3] = {pos[0], pos[1], pos[2]};
+  for (int dim = 0; dim < nuchan; dim ++) {
+    int pos_p[3] = {pos[0], pos[1], pos[2]};
     pos_p[dim] += 1;
-    int32_t pos_n[3] = {pos[0], pos[1], pos[2]};
+    int pos_n[3] = {pos[0], pos[1], pos[2]};
     pos_n[dim] -= 1;
 
     // Look at the neighbor to the right (pos) and to the left (neg).
@@ -892,11 +1010,11 @@ static int tfluids_CudaMain_calcVelocityDivergence(lua_State *L) {
   if (u->nDimension != 5 || u_div->nDimension != 4 || geom->nDimension != 4) {
     luaL_error(L, "Incorrect dimensions.");
   }
-  const int32_t nbatch = u->size[0];
-  const int32_t nuchan = u->size[1];
-  const int32_t zdim = u->size[2];
-  const int32_t ydim = u->size[3];
-  const int32_t xdim = u->size[4];
+  const int nbatch = u->size[0];
+  const int nuchan = u->size[1];
+  const int zdim = u->size[2];
+  const int ydim = u->size[3];
+  const int xdim = u->size[4];
 
   THCDeviceTensor<float, 5> dev_u = toDeviceTensor<float, 5>(state, u);
   THCDeviceTensor<float, 4> dev_u_div = toDeviceTensor<float, 4>(state, u_div);
@@ -914,6 +1032,10 @@ static int tfluids_CudaMain_calcVelocityDivergence(lua_State *L) {
 
   return 0;
 }
+
+//******************************************************************************
+// calcVelocityDivergenceBackward
+//******************************************************************************
 
 // calcVelocityDivergenceBackward CUDA kernel.
 __global__ void kernel_calcVelocityDivergenceBackward(
@@ -939,10 +1061,10 @@ __global__ void kernel_calcVelocityDivergenceBackward(
   const int size[3] = {xdim, ydim, zdim};
 
   // Now calculate the partial derivatives in each dimension.
-  for (int32_t dim = 0; dim < nuchan; dim ++) {
-    int32_t pos_p[3] = {pos[0], pos[1], pos[2]};
+  for (int dim = 0; dim < nuchan; dim ++) {
+    int pos_p[3] = {pos[0], pos[1], pos[2]};
     pos_p[dim] += 1;
-    int32_t pos_n[3] = {pos[0], pos[1], pos[2]};
+    int pos_n[3] = {pos[0], pos[1], pos[2]};
     pos_n[dim] -= 1;
 
     // Look at the neighbor to the right (pos) and to the left (neg).
@@ -1001,11 +1123,11 @@ static int tfluids_CudaMain_calcVelocityDivergenceBackward(lua_State *L) {
       grad_output->nDimension != 4) {
     luaL_error(L, "Incorrect dimensions.");
   }
-  const int32_t nbatch = u->size[0];
-  const int32_t nuchan = u->size[1];
-  const int32_t zdim = u->size[2];
-  const int32_t ydim = u->size[3];
-  const int32_t xdim = u->size[4];
+  const int nbatch = u->size[0];
+  const int nuchan = u->size[1];
+  const int zdim = u->size[2];
+  const int ydim = u->size[3];
+  const int xdim = u->size[4];
 
   // We will be accumulating gradient contributions into the grad_u tensor, so
   // we first need to zero it.
@@ -1031,6 +1153,10 @@ static int tfluids_CudaMain_calcVelocityDivergenceBackward(lua_State *L) {
   return 0;
 }
 
+//******************************************************************************
+// solveLinearSystemPCG
+//******************************************************************************
+
 // solveLinearSystemPCG lua entry point.
 static int tfluids_CudaMain_solveLinearSystemPCG(lua_State *L) {
   init_cusparse();  // No op if already initialized.
@@ -1050,11 +1176,11 @@ static int tfluids_CudaMain_solveLinearSystemPCG(lua_State *L) {
     luaL_error(L, "Incorrect dimensions. "
                   "Expect delta_u: 5, p: 4, geom: 4, u: 5.");
   }
-  const int32_t nbatch = delta_u->size[0];
-  const int32_t nuchan = delta_u->size[1];  // Can only be 2 or 3.
-  const int32_t zdim = delta_u->size[2];
-  const int32_t ydim = delta_u->size[3];
-  const int32_t xdim = delta_u->size[4];
+  const int nbatch = delta_u->size[0];
+  const int nuchan = delta_u->size[1];  // Can only be 2 or 3.
+  const int zdim = delta_u->size[2];
+  const int ydim = delta_u->size[3];
+  const int xdim = delta_u->size[4];
   THCDeviceTensor<float, 5> dev_delta_u =
       toDeviceTensor<float, 5>(state, delta_u);
   THCDeviceTensor<float, 4> dev_p = toDeviceTensor<float, 4>(state, p);
@@ -1082,6 +1208,970 @@ static int tfluids_CudaMain_solveLinearSystemPCG(lua_State *L) {
   return 0;
 }
 
+//******************************************************************************
+// HELPER METHODS FOR ADVECTION ROUTINES
+//******************************************************************************
+
+// I HATE doing this, but I copied this code from here:
+// https://github.com/erich666/GraphicsGems/blob/master/gems/RayBox.c
+// And modified it (there were actually a few numerical precision bugs).
+// I tested the hell out of it, so it seems to work.
+//
+// @param hit_margin - value >= 0 describing margin added to hit to
+// prevent interpenetration.
+__device__ __forceinline__ bool HitBoundingBoxCUDA(
+    const float minB[3], const float maxB[3],  // box
+    const float origin[3], const float dir[3],  // ray
+    float coord[3]) {  // hit point.
+  char inside = true;
+  Quadrants quadrant[3];
+  int i;
+  int whichPlane;
+  float maxT[3];
+  float candidate_plane[3];
+
+  // Find candidate planes; this loop can be avoided if rays cast all from the
+  // eye (assume perpsective view).
+  for (i = 0; i < 3; i++) {
+    if (origin[i] < minB[i]) {
+      quadrant[i] = LEFT;
+      candidate_plane[i] = minB[i];
+      inside = false;
+    } else if (origin[i] > maxB[i]) {
+      quadrant[i] = RIGHT;
+      candidate_plane[i] = maxB[i];
+      inside = false;
+    } else {
+      quadrant[i] = MIDDLE;
+    }
+  }
+
+  // Ray origin inside bounding box.
+  if (inside) {
+    for (i = 0; i < 3; i++) {
+      coord[i] = origin[i];
+    }
+    return true;
+  }
+
+  // Calculate T distances to candidate planes.
+  for (i = 0; i < 3; i++) {
+    if (quadrant[i] != MIDDLE && dir[i] != 0.0f) { 
+      maxT[i] = (candidate_plane[i] - origin[i]) / dir[i];
+    } else {
+      maxT[i] = -1.0f;
+    }
+  }
+
+  // Get largest of the maxT's for final choice of intersection.
+  whichPlane = 0;
+  for (i = 1; i < 3; i++) {
+    if (maxT[whichPlane] < maxT[i]) {
+      whichPlane = i;
+    }
+  }
+
+  // Check final candidate actually inside box and calculate the coords (if
+  // not).
+  if (maxT[whichPlane] < 0.0f) {
+    return false;
+  }
+
+  const float err_tol = 1e-6f;
+  for (i = 0; i < 3; i++) {
+    if (whichPlane != i) {
+      coord[i] = origin[i] + maxT[whichPlane] * dir[i];
+      if (coord[i] < (minB[i] - err_tol) || coord[i] > (maxB[i] + err_tol)) {
+        return false;
+      }
+    } else {
+      coord[i] = candidate_plane[i];
+    }
+  }
+
+  return true;
+}   
+
+// calcRayBoxIntersection will calculate the intersection point for the ray
+// starting at pos, and pointing along dt (which should be unit length).
+// The box is size 1 and is centered at ctr.
+//
+// This is really just a wrapper around the function above.
+__device__ __forceinline__ bool calcRayBoxIntersectionCUDA(
+    const float pos[3], const float dt[3],
+    const float ctr[3], const float hit_margin, float ipos[3]) {
+  assert(hit_margin >= 0);
+  float box_min[3];
+  box_min[0] = ctr[0] - 0.5f - hit_margin;
+  box_min[1] = ctr[1] - 0.5f - hit_margin;
+  box_min[2] = ctr[2] - 0.5f - hit_margin;
+  float box_max[3];
+  box_max[0] = ctr[0] + 0.5f + hit_margin;
+  box_max[1] = ctr[1] + 0.5f + hit_margin;
+  box_max[2] = ctr[2] + 0.5f + hit_margin;
+
+  return HitBoundingBoxCUDA(box_min, box_max,  // box
+                            pos, dt,  // ray
+                            ipos);
+}
+
+// calcRayBorderIntersection will calculate the intersection point for the ray
+// starting at pos and pointing to next_pos.
+//
+// IMPORTANT: This function ASSUMES that the ray actually intersects. Nasty
+// things will happen if it does not.
+// EDIT(tompson, 09/25/16): This is so important that we'll actually double
+// check the input coords anyway.
+__device__ __forceinline__ bool calcRayBorderIntersectionCUDA(
+    const float pos[3], const float next_pos[3],
+    const THCDeviceTensor<float, 3>& geom, const float hit_margin,
+    float ipos[3]) {
+  assert(hit_margin >= 0);
+
+  // The source location should be INSIDE the boundary.
+  assert(!IsOutOfDomainReal(pos, geom));
+  
+  // The target location should be OUTSIDE the boundary.
+  assert(IsOutOfDomainReal(next_pos, geom));
+
+  const float dimsx = (float)geom.getSize(2);
+  const float dimsy = (float)geom.getSize(1);
+  const float dimsz = (float)geom.getSize(0);
+
+  // Calculate the minimum step length to exit each face and then step that
+  // far. The line equation is:
+  //   P = gamma * (next_pos - pos) + pos.
+  // So calculate gamma required to make P < -0.5 + margin for each dim
+  // independently.
+  //   P_i = -0.5+m --> -0.5+m - pos_i = gamma * (next_pos_i - pos_i)
+  //              --> gamma_i = (-0.5+m - pos_i) / (next_pos_i - pos_i)
+  float min_step = max_float;
+  if (next_pos[0] <= -0.5f) {  // left face of cell.
+    const float dx = next_pos[0] - pos[0];
+    if (dx > 1e-6f || dx < -1e-6f) {
+      const float xstep = (-0.5f + hit_margin - pos[0]) / dx;
+      min_step = min(min_step, xstep);
+    }
+  }
+  if (next_pos[1] <= -0.5f) {
+    const float dy = next_pos[1] - pos[1];
+    if (dy > 1e-6f || dy < -1e-6f) {
+      const float ystep = (-0.5f + hit_margin - pos[1]) / dy;
+      min_step = min(min_step, ystep);
+    }
+  }
+  if (next_pos[2] <= -0.5f) {
+    const float dz = next_pos[2] - pos[2];
+    if (dz > 1e-6f || dz < -1e-6f) {
+      const float zstep = (-0.5f + hit_margin - pos[2]) / dz;
+      min_step = min(min_step, zstep);
+    }
+  }
+  // Also calculate the min step to exit a positive face.
+  //   P_i = dim - 0.5 - m --> dim - 0.5 - m - pos_i =
+  //                             gamma * (next_pos_i - pos_i)
+  //                       --> gamma = (dim - 0.5 - m - pos_i) /
+  //                                   (next_pos_i - pos_i)
+  if (next_pos[0] >= dimsx - 0.5f) {  // right face of cell.
+    const float dx = next_pos[0] - pos[0];
+    if (dx > 1e-6f || dx < -1e-6f) {
+      const float xstep = (dimsx - 0.5f - hit_margin - pos[0]) / dx;
+      min_step = min(min_step, xstep);
+    }
+  }
+  if (next_pos[1] >= dimsy - 0.5f) {
+    const float dy = next_pos[1] - pos[1];
+    if (dy > 1e-6f || dy < -1e-6f) {
+      const float ystep = (dimsy - 0.5f - hit_margin - pos[1]) / dy;
+      min_step = min(min_step, ystep);
+    }
+  }
+  if (next_pos[2] >= dimsz - 0.5f) {
+    const float dz = next_pos[2] - pos[2];
+    if (dz > 1e-6f || dz < -1e-6f) {
+      const float zstep = (dimsz - 0.5f - hit_margin - pos[2]) / dz;
+      min_step = min(min_step, zstep);
+    }
+  }
+  if (min_step < 0 || min_step >= max_float) {
+    return false;
+  }
+
+  // Take the minimum step.
+  ipos[0] = min_step * (next_pos[0] - pos[0]) + pos[0];
+  ipos[1] = min_step * (next_pos[1] - pos[1]) + pos[1];
+  ipos[2] = min_step * (next_pos[2] - pos[2]) + pos[2];
+
+  return true;
+}
+
+// The following function performs a line trace along the displacement vector
+// and returns either:
+// a) The position 'p + delta' if NO geometry is found on the line trace. or
+// b) The position at the first geometry blocker along the path.
+// The search is exhaustive (i.e. O(n) in the length of the displacement vector)
+//
+// Note: the returned position is NEVER in geometry or outside the bounds. We
+// go to great lengths to ensure this.
+//
+// TODO(tompsion): This is probably not efficient at all.
+// It also has the potential to miss geometry along the path if the width
+// of the geometry is less than 1 grid.
+//
+// NOTE: Pos = (0, 0, 0) is the CENTER of the first grid cell.
+//       Pos = (0.5, 0, 0) is the x face between the first 2 cells.
+__device__ __forceinline__ bool calcLineTraceCUDA(
+    const float pos[3], const float delta[3],
+    const THCDeviceTensor<float, 3>& geom, float new_pos[3]) {
+  // If we're ALREADY in a geometry segment (or outside the domain) then a lot
+  // of logic below with fail. This function should only be called on fluid
+  // cells!
+  assert(!IsOutOfDomainReal(pos, geom) && !IsBlockedCellReal(geom, pos));
+
+  new_pos[0] = pos[0];
+  new_pos[1] = pos[1];
+  new_pos[2] = pos[2];
+
+  const float length = length3(delta);
+  if (length <= 1e-6f) {
+    // We're not being asked to step anywhere. Return false and copy the pos.
+    // (copy already done above).
+    return false;
+  }
+  // Figure out the step size in x, y and z for our marching.
+  float dt[3];
+  dt[0] = delta[0] / length;  // Recall: we've already check for div zero.
+  dt[1] = delta[1] / length;
+  dt[2] = delta[2] / length;
+
+  // Otherwise, we start the line search, by stepping a unit length along the
+  // vector and checking the neighbours.
+  //
+  // A few words about the implementation (because it's complicated and perhaps
+  // needlessly so). We maintain a VERY important loop invariant: new_pos is
+  // NEVER allowed to enter solid geometry or go off the domain. next_pos
+  // is the next step's tentative location, and we will always try and back
+  // it off to the closest non-geometry valid cell before updating new_pos.
+  //
+  // We will also go to great lengths to ensure this loop invariant is
+  // correct (probably at the expense of speed).
+  float cur_length = 0;
+  float next_pos[3];  // Tentative step location.
+
+  // TODO(tompson): This while loop is likely REALLY slow and stupid in CUDA.
+  // This is just a straight C++ to CUDA port, but likely we need to do
+  // something smarter (because all threads are going to be in lock-step
+  // throughout the entire loop and we have lots and lots of branching
+  // conditionals).
+
+  while (cur_length < (length - hit_margin)) {
+    // We haven't stepped far enough. So take a step.
+    float cur_step = min(length - cur_length, 1.0f);
+    next_pos[0] = new_pos[0] + cur_step * dt[0];
+    next_pos[1] = new_pos[1] + cur_step * dt[1];
+    next_pos[2] = new_pos[2] + cur_step * dt[2];
+
+    // Check to see if we went too far.
+    // TODO(tompson): This is not correct, we might skip over small
+    // pieces of geometry if the ray brushes against the corner of a
+    // occupied voxel, but doesn't land in it. Fix this (it's very rare though).
+  
+    // There are two possible cases. We've either stepped out of the domain
+    // or entered a blocked cell.
+    if (IsOutOfDomainReal(next_pos, geom)) {
+      // Case 1. 'next_pos' exits the grid.
+      float ipos[3];
+      const bool hit = calcRayBorderIntersectionCUDA(new_pos, next_pos, geom, 
+                                                     hit_margin, ipos);
+      if (!hit) {
+        // This is an EXTREMELY rare case. It happens once or twice during
+        // training. It happens because either the ray is almost parallel
+        // to the domain boundary, OR floating point round-off causes the
+        // intersection test to fail.
+        // In this case, fall back to simply clamping next_pos inside the domain
+        // boundary. It's not ideal, but better than a hard failure.
+        ipos[0] = next_pos[0];
+        ipos[1] = next_pos[1];
+        ipos[2] = next_pos[2];
+        ClampToDomainReal(ipos, geom);
+      }
+
+      // Do some sanity checks. I'd rather be slow and correct...
+      // The logic above should aways put ipos back inside the simulation
+      // domain.
+      assert(!IsOutOfDomainReal(ipos, geom));
+
+      if (!IsBlockedCellReal(geom, ipos)) {
+        // OK to return here (i.e. we're up against the border and not
+        // in a blocked cell).
+        new_pos[0] = ipos[0];
+        new_pos[1] = ipos[1];
+        new_pos[2] = ipos[2];
+        return true;
+      } else {
+        // Otherwise, we hit the border boundary, but we entered a blocked cell.
+        // Continue on to case 2.
+        next_pos[0] = ipos[0];
+        next_pos[1] = ipos[1];
+        next_pos[2] = ipos[2];
+      }
+    }
+    if (IsBlockedCellReal(geom, next_pos)) {
+      // Case 2. next_pos enters a blocked cell.
+
+      // If the source of the ray starts in a blocked cell, we'll never exit
+      // the while loop below, also our loop invariant is that new_pos is
+      // NEVER allowed to enter a geometry cell. So failing this test means
+      // our logic is broken.
+      assert(!IsBlockedCellReal(geom, new_pos));
+      int count = 0;
+      const int max_count = 100;
+      static_cast<void>(max_count);
+      while (IsBlockedCellReal(geom, next_pos)) {
+        // Calculate the center of the blocker cell.
+        float next_pos_ctr[3];
+        int ix, iy, iz;
+        GetPixelCenter(next_pos, &ix, &iy, &iz);
+        next_pos_ctr[0] = (float)(ix);
+        next_pos_ctr[1] = (float)(iy);
+        next_pos_ctr[2] = (float)(iz);
+        
+        // Sanity check. This is redundant because IsBlockedCellReal USES
+        // GetPixelCenter to sample the geometry field. But keep this here
+        // just in case the implementation changes.
+        assert(IsBlockedCellReal(geom, next_pos_ctr));
+
+        // Center of blocker cell should not be out of the domain.
+        assert(!IsOutOfDomainReal(next_pos_ctr, geom));
+
+        float ipos[3];
+        const bool hit = calcRayBoxIntersectionCUDA(new_pos, dt, next_pos_ctr,
+                                                    hit_margin, ipos);
+        // Hard assert if we didn't hit (even on release builds) because we
+        // should have hit the aabbox!
+        if (!hit) {
+          // EDIT: This can happen in very rare cases if the ray box
+          // intersection test fails because of floating point round off.
+          // It can also happen if the simulation becomes unstable (maybe with a
+          // poorly trained model) and the velocity values are extremely high.
+          
+          // In this case, fall back to simply returning new_pos (for which the
+          // loop invariant guarantees is a valid point).
+          next_pos[0] = new_pos[0];
+          next_pos[1] = new_pos[1];
+          next_pos[2] = new_pos[2];
+          return true;
+        }
+  
+        next_pos[0] = ipos[0];
+        next_pos[1] = ipos[1];
+        next_pos[2] = ipos[2];
+
+        // There's a nasty corner case here. It's when the cell we were trying
+        // to step to WAS a blocker, but the ray passed through a blocker to get
+        // there (i.e. our step size didn't catch the first blocker). If this is
+        // the case we need to do another intersection test, but this time with
+        // the ray point destination that is the closer cell.
+        // --> There's nothing to do. The outer while loop will try another
+        // intersection for us.
+
+        // A basic test to make sure we never spin here indefinitely (I've
+        // never seen it, but just in case).
+        count++;
+        assert(count < max_count);
+      }
+      
+      // At this point next_pos is guaranteed to be within the domain and
+      // not within a solid cell. 
+      new_pos[0] = next_pos[0];
+      new_pos[1] = next_pos[1];
+      new_pos[2] = next_pos[2];
+
+      // Do some sanity checks.
+      assert(!IsBlockedCellReal(geom, new_pos));
+      assert(!IsOutOfDomainReal(new_pos, geom));
+      return true;
+    }
+
+    // Otherwise, update the position to the current step location.
+    new_pos[0] = next_pos[0];
+    new_pos[1] = next_pos[1];
+    new_pos[2] = next_pos[2];
+
+    // Do some sanity checks and check the loop invariant.
+    assert(!IsBlockedCellReal(geom, new_pos));
+    assert(!IsOutOfDomainReal(new_pos, geom));
+
+    cur_length += cur_step;
+  }
+
+  // Finally, yet another set of checks, just in case.
+  assert(!IsOutOfDomainReal(new_pos, geom));
+  assert(!IsBlockedCellReal(geom, new_pos));
+
+  return false;
+}
+
+__device__ __forceinline__ void MixWithGeomCUDA(
+    const float a, const float b, const bool a_geom, const bool b_geom,
+    const bool sample_into_geom, const float t, float* interp_val,
+    bool* interp_geom) {
+  if (sample_into_geom || (!a_geom && !b_geom)) {
+    *interp_geom = false;
+    *interp_val = (1.0f - t) * a + t * b;
+  } else if (a_geom && !b_geom) {
+    *interp_geom = false;
+    *interp_val = b;  // a is geometry, return b.
+  } else if (b_geom && !a_geom) {
+    *interp_geom = false;
+    *interp_val = a;  // b is geometry, return a.
+  } else {
+    *interp_geom = true;  // both a and b are geom.
+    *interp_val = 0.0f;
+  }
+}
+
+// NOTE: As per our CalcLineTrace method we define the integer position values
+// as THE CENTER of the grid cells. That means that a value of (0, 0, 0) is the
+// center of the first grid cell, so the (-0.5, 0, 0) position is the LEFT
+// face of the first cell. Likewise (xdim - 0.5, ydim - 0.5, zdim - 0.5) is the
+// upper bound of the grid (right at the corner).
+//
+// You should NEVER call this function on a grid cell that is either
+// GEOMETRY (obs[pos] == 1) or touching the grid domain. If this is the case
+// then likely the CalcLineTrace function failed and this is a logic bug
+// (CalcLineTrace should stop the line trace BEFORE going into an invalid
+// region).
+//
+// If sample_into_geom is true then we will do bilinear interpolation into
+// neighboring geometry cells (this is done during velocity advection since we
+// set the internal geom velocities to zero out geometry face velocity).
+// Otherwise, we will clamp the scalar field value at the non-geometry boundary.
+__device__ __forceinline__ float GetInterpValueCUDA(
+    const THCDeviceTensor<float, 3>& x, const THCDeviceTensor<float, 3>& obs,
+    const float pos[3], const bool sample_into_geom) {
+
+  // TODO(tompson,kris): THIS ASSUMES THAT OBSTACLES HAVE ZERO VELOCITY.
+
+  // Make sure we're not against the grid boundary or beyond it.
+  // This is a conservative test (i.e. we test if position is on or beyond it).
+  assert(!IsOutOfDomainReal(pos, obs));
+
+  // Get the current integer location of the pixel.
+  int i0, j0, k0;
+  GetPixelCenter(pos, &i0, &j0, &k0);
+  assert(!IsOutOfDomain(i0, j0, k0, obs));
+
+  // The current center SHOULD NOT be geometry.
+  assert(!IsBlockedCell(obs, i0, j0, k0));
+
+  const int dimsx = obs.getSize(2);
+  const int dimsy = obs.getSize(1);
+  const int dimsz = obs.getSize(0);
+
+  // Calculate the next cell integer to interpolate with AND calculate the
+  // interpolation coefficient.
+
+  // If we're on the left hand size of the grid center we should be
+  // interpolating left (p0) to center (p1), and if we're on the right we
+  // should be interpolating center (p0) to right (p1).
+  // RECALL: (0,0) is defined as the CENTER of the first cell. (xdim - 1,
+  // ydim - 1) is defined as the center of the last cell.
+  float icoef, jcoef, kcoef;
+  int i1, j1, k1;
+  if (pos[0] < (float)(i0)) {
+    i1 = i0;
+    i0 = max(i0 - 1, 0);
+  } else {
+    i1 = min(i0 + 1, dimsx - 1);
+  }
+  icoef = (i0 == i1) ? 0.0f : pos[0] - (float)(i0);
+
+  // Same logic for top / bottom and front / back interp.
+  if (pos[1] < (float)(j0)) {
+    j1 = j0;
+    j0 = max(j0 - 1, 0);
+  } else {
+    j1 = min(j0 + 1, dimsy - 1);
+  }
+  jcoef = (j0 == j1) ? 0.0f : pos[1] - (float)(j0);
+
+  if (pos[2] < (float)(k0)) {
+    k1 = k0;
+    k0 = max(k0 - 1, 0);
+  } else {
+    k1 = min(k0 + 1, dimsz - 1);
+  }
+  kcoef = (k0 == k1) ? 0.0f : pos[2] - (float)(k0);
+
+  // Mixing coefficients should be in [0, 1].
+  assert(icoef >= 0 && icoef <= 1 && jcoef >= 0 && jcoef <= 1 &&
+         kcoef >= 0 && kcoef <= 1);
+
+  // Interpolation coordinates should be in the domain.
+  assert(!IsOutOfDomain(i0, j0, k0, dims) && !IsOutOfDomain(i1, j1, k1, dims));
+
+  // Note: we DO NOT need to handle geometry when doing the trilinear
+  // interpolation:
+  // 1. The particle trace is gaurenteed to return a position that is NOT within
+  // geometry (but can be epsilon away from a geometry wall).
+  // 2. We have called setObstacleBcs prior to running advection which
+  // allows us to interpolate one level into geometry without violating
+  // constraints (it does so by setting geometry velocities such that the face
+  // velocity is zero).
+
+  // Assume a cube with 8 points.
+  // Front face.
+  // Top Front MIX.
+  const float xFrontLeftTop = x[k0][j1][i0];
+  const bool gFrontLeftTop = IsBlockedCell(obs, i0, j1, k0);
+  const float xFrontRightTop =  x[k0][j1][i1];
+  const bool gFrontRightTop = IsBlockedCell(obs, i1, j1, k0);
+  float xFrontTopInterp;
+  bool gFrontTopInterp;
+  MixWithGeomCUDA(xFrontLeftTop, xFrontRightTop, gFrontLeftTop, gFrontRightTop,
+                  sample_into_geom, icoef, &xFrontTopInterp, &gFrontTopInterp);
+
+  // Bottom Front MIX.
+  const float xFrontLeftBottom = x[k0][j0][i0];
+  const bool gFrontLeftBottom = IsBlockedCell(obs, i0, j0, k0);
+  const float xFrontRightBottom = x[k0][j0][i1];
+  const bool gFrontRightBottom = IsBlockedCell(obs, i1, j0, k0);
+  float xFrontBottomInterp;
+  bool gFrontBottomInterp;
+  MixWithGeomCUDA(
+    xFrontLeftBottom, xFrontRightBottom, gFrontLeftBottom, gFrontRightBottom,
+    sample_into_geom, icoef, &xFrontBottomInterp, &gFrontBottomInterp);
+
+  // Back face.
+  // Top Back MIX.
+  const float xBackLeftTop = x[k1][j1][i0];
+  const bool gBackLeftTop = IsBlockedCell(obs, i0, j1, k1);
+  const float xBackRightTop = x[k1][j1][i1];
+  const bool gBackRightTop = IsBlockedCell(obs, i1, j1, k1);
+  float xBackTopInterp;
+  bool gBackTopInterp;
+  MixWithGeomCUDA(xBackLeftTop, xBackRightTop, gBackLeftTop, gBackRightTop,
+                  sample_into_geom, icoef, &xBackTopInterp, &gBackTopInterp);
+
+  // Bottom Back MIX.
+  const float xBackLeftBottom = x[k1][j0][i0];
+  const bool gBackLeftBottom = IsBlockedCell(obs, i0, j0, k1);
+  const float xBackRightBottom = x[k1][j0][i1];
+  const bool gBackRightBottom = IsBlockedCell(obs, i1, j0, k1);
+  float xBackBottomInterp;
+  bool gBackBottomInterp;
+  MixWithGeomCUDA(
+      xBackLeftBottom, xBackRightBottom, gBackLeftBottom, gBackRightBottom,
+      sample_into_geom, icoef, &xBackBottomInterp, &gBackBottomInterp);
+
+  // Now get middle of front - The bilinear interp of the front face.
+  float xBiLerpFront;
+  bool gBiLerpFront;
+  MixWithGeomCUDA(
+      xFrontBottomInterp, xFrontTopInterp, gFrontBottomInterp, gFrontTopInterp,
+      sample_into_geom, jcoef, &xBiLerpFront, &gBiLerpFront);
+
+  // Now get middle of back - The bilinear interp of the back face.
+  float xBiLerpBack;
+  bool gBiLerpBack;
+  MixWithGeomCUDA(
+      xBackBottomInterp, xBackTopInterp, gBackBottomInterp, gBackTopInterp,
+      sample_into_geom, jcoef, &xBiLerpBack, &gBiLerpBack);
+
+  // Now get the interpolated point between the points calculated in the front
+  // and back faces - The trilinear interp part.
+  float xTriLerp;
+  bool gTriLerp;
+  MixWithGeomCUDA(xBiLerpFront, xBiLerpBack, gBiLerpFront, gBiLerpBack,
+                  sample_into_geom, kcoef, &xTriLerp, &gTriLerp);
+
+  // At least ONE of the samples shouldn't have been geometry so the final value
+  // should be valid.
+  assert(!gTriLerp);
+
+  return xTriLerp;
+}
+
+__device__ __forceinline__ float sampleFieldCUDA(
+    const THCDeviceTensor<float, 3>& field, const float pos[3],
+    const THCDeviceTensor<float, 3>& geom, const bool sample_into_geom) {
+  // This is a stupid wrap. But keep for argument parity with the C++ code.
+  return GetInterpValueCUDA(field, geom, pos, sample_into_geom);
+}
+
+//******************************************************************************
+// advectScalar
+//******************************************************************************
+
+// advectScalarEuler CUDA kernel.
+__global__ void kernel_advectScalarEuler(
+    const float dt, THCDeviceTensor<float, 3> p, THCDeviceTensor<float, 3> ux,
+    THCDeviceTensor<float, 3> uy, THCDeviceTensor<float, 3> uz,
+    THCDeviceTensor<float, 3> geom, const bool two_dim,
+    THCDeviceTensor<float, 3> p_dst, const bool sample_into_geom) {
+  const int i = threadIdx.x + blockIdx.x * blockDim.x;
+  const int j = blockIdx.y;  // U-slice, i.e. Ux, Uy or Uz.
+  const int k = blockIdx.z;
+  if (i >= p.getSize(2)) {
+    return;
+  }
+
+  if (geom[k][j][i] > 0.0f) {
+    // Don't advect blocked cells.
+    return;
+  }
+
+  // NOTE: The integer positions are in the center of the grid cells
+  const float pos[3] = {(float)i, (float)j, (float)k};  // i.e. (x, y, z)
+  
+  // Velocity is in grids / second.
+  const float vel[3] = {ux[k][j][i], uy[k][j][i],
+                        two_dim ? 0.0f : uz[k][j][i]};
+  
+  // Backtrace based upon current velocity at cell center.
+  const float displacement[3] = {-dt * vel[0], -dt * vel[1], -dt * vel[2]};
+  float back_pos[3];
+  // Step along the displacement vector. calcLineTrace will handle
+  // boundary conditions for us. Note: it will terminate BEFORE the
+  // boundary (i.e. the returned position is always valid).
+  const bool hit_boundary = calcLineTraceCUDA(pos, displacement, geom,
+                                              back_pos);
+  
+  // Check the return value from calcLineTrace just in case.
+  assert(!IsOutOfDomainReal(back_pos, geom) &&
+         !IsBlockedCellReal(obs, back_pos));
+  
+  // Finally, sample the value at the new position.
+  p_dst[k][j][i] = sampleFieldCUDA(p, back_pos, geom, sample_into_geom);
+} 
+
+// advectScalarRK2 CUDA kernel.
+__global__ void kernel_advectScalarRK2(
+    const float dt, THCDeviceTensor<float, 3> p, THCDeviceTensor<float, 3> ux,
+    THCDeviceTensor<float, 3> uy, THCDeviceTensor<float, 3> uz,
+    THCDeviceTensor<float, 3> geom, const bool two_dim,
+    THCDeviceTensor<float, 3> p_dst, const bool sample_into_geom) {
+  const int i = threadIdx.x + blockIdx.x * blockDim.x;
+  const int j = blockIdx.y;  // U-slice, i.e. Ux, Uy or Uz.
+  const int k = blockIdx.z;
+  if (i >= p.getSize(2)) {
+    return;
+  }
+
+  if (geom[k][j][i] > 0.0f) {
+    // Don't advect blocked cells.
+    return;
+  }
+
+  // NOTE: The integer positions are in the center of the grid cells
+  const float pos[3] = {(float)i, (float)j, (float)k};  // i.e. (x, y, z)
+
+  // Velocity is in grids / second.
+  float vel[3] = {ux[k][j][i], uy[k][j][i], two_dim ? 0.0f : uz[k][j][i]};
+
+  // Backtrace a half step based upon current velocity at cell center.
+  float displacement[3] = {0.5f * (-dt) * vel[0],
+                           0.5f * (-dt) * vel[1],
+                           0.5f * (-dt) * vel[2]};
+  float half_pos[3];
+  // Step along the displacement vector. calcLineTrace will handle
+  // boundary conditions for us. Note: it will terminate BEFORE the
+  // boundary (i.e. the returned position is always valid).
+  const bool hit_boundary_half = calcLineTraceCUDA(pos, displacement, geom,
+                                                   half_pos);
+
+  // Check the return value from calcLineTrace just in case.
+  assert(!IsOutOfDomainReal(half_pos, geom) &&
+         !IsBlockedCellReal(obs, half_pos));
+
+  if (hit_boundary_half) {
+    // We hit the boundary, then as per Bridson, we should clamp the
+    // backwards trace. Note: if we treated this as a full euler step, we 
+    // would have hit the same blocker because the line trace is linear.
+    // TODO(tompson,kris): I'm pretty sure this is the best we could do
+    // but I still worry about numerical stability.
+    p_dst[k][j][i] = sampleFieldCUDA(p, half_pos, geom, sample_into_geom);
+    return;
+  }
+
+  // Sample the velocity at this half step location.
+  // Note: dereferencing a 4D tensor returns a detail::THCDeviceSubTensor<...>
+  // instance, NOT a THCDeviceTensor instance. We therefore need to create
+  // new view instances (using the view function).
+  vel[0] = sampleFieldCUDA(ux, half_pos, geom, true);
+  vel[1] = sampleFieldCUDA(uy, half_pos, geom, true);
+  vel[2] = two_dim ? 0.0f : sampleFieldCUDA(uz, half_pos, geom, true);
+
+  // Do another line trace using this half position's velocity.
+  float back_pos[3];
+  displacement[0] = -dt * vel[0];
+  displacement[1] = -dt * vel[1];
+  displacement[2] = -dt * vel[2];
+  const bool hit_boundary = calcLineTraceCUDA(pos, displacement, geom,
+                                              back_pos);
+
+  // Again, check the return value from calcLineTrace just in case.
+  assert(!IsOutOfDomainReal(back_pos, geom) &&
+         !IsBlockedCellReal(obs, back_pos));
+
+  // Sample the value at the new position.
+  p_dst[k][j][i] = sampleFieldCUDA(p, back_pos, geom, sample_into_geom);
+}
+
+// advectScalar lua entry point.
+static int tfluids_CudaMain_advectScalar(lua_State *L) {
+  THCState* state = cutorch_getstate(L);
+
+  const float dt = (float)(lua_tonumber(L, 1));
+  THCudaTensor* p = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 2, "torch.CudaTensor"));
+  THCudaTensor* u = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 3, "torch.CudaTensor"));
+  THCudaTensor* geom = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 4, "torch.CudaTensor"));
+  THCudaTensor* p_dst = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 5, "torch.CudaTensor"));
+  const std::string method = static_cast<std::string>(lua_tostring(L, 6));
+  const bool sample_into_geom = static_cast<bool>(lua_toboolean(L, 7));
+
+  if (p->nDimension != 3 || u->nDimension != 4 || geom->nDimension != 3 ||
+      p_dst->nDimension != 3) {
+    luaL_error(L, "Incorrect dimensions.");
+  }
+  const bool two_dim = u->size[0] == 2;
+
+  THCDeviceTensor<float, 3> dev_p = toDeviceTensor<float, 3>(state, p);
+  THCDeviceTensor<float, 4> dev_u = toDeviceTensor<float, 4>(state, u);
+  THCDeviceTensor<float, 3> dev_geom = toDeviceTensor<float, 3>(state, geom);
+  THCDeviceTensor<float, 3> dev_p_dst = toDeviceTensor<float, 3>(state, p_dst);
+  
+  // One "thread" per output element.
+  int nplane = dev_p_dst.getSize(2);
+  dim3 grid_size(THCCeilDiv(nplane, 256), dev_p_dst.getSize(1),
+                 dev_p_dst.getSize(0));  // (x, y, z)
+  dim3 block_size(nplane > 256 ? 256 : nplane);
+
+  // We have to dereference the 4D u tensor into x, y, and z components.
+  // The reason for this is that dereferencing these in the kernel results in
+  // THCDeviceSubTensor instances, which then cannot be passed to our sampling
+  // function (which expects THCDeviceTensors only). Unfortunately, the view
+  // method is host only, so we have to perform it here.
+  THCDeviceTensor<float, 3> dev_ux = dev_u[0].view();
+  THCDeviceTensor<float, 3> dev_uy = dev_u[1].view();
+  // Note, if two_dim is true, we will set the z channel to an empty tensor.
+  THCDeviceTensor<float, 3> dev_uz =
+      two_dim ? THCDeviceTensor<float, 3>() : dev_u[2].view();
+
+  if (method == "rk2") {
+    kernel_advectScalarRK2<<<grid_size, block_size, 0,
+                             THCState_getCurrentStream(state)>>>(
+        dt, dev_p, dev_ux, dev_uy, dev_uz, dev_geom, two_dim, dev_p_dst,
+        sample_into_geom);
+  } else if (method == "euler") {
+    kernel_advectScalarEuler<<<grid_size, block_size, 0,
+                               THCState_getCurrentStream(state)>>>(
+        dt, dev_p, dev_ux, dev_uy, dev_uz, dev_geom, two_dim, dev_p_dst,
+        sample_into_geom);
+  } else if (method == "maccormack") {
+    luaL_error(L, "maccormack not yet implemented.");
+  } else {
+    luaL_error(L, "Invalid advection method.");
+  }
+
+  return 0;
+}
+
+//******************************************************************************
+// advectVel
+//******************************************************************************
+
+// advectVelEuler CUDA kernel.
+__global__ void kernel_advectVelEuler(
+    const float dt, THCDeviceTensor<float, 3> ux,
+    THCDeviceTensor<float, 3> uy, THCDeviceTensor<float, 3> uz,
+    THCDeviceTensor<float, 3> geom, const bool two_dim,
+    THCDeviceTensor<float, 3> ux_dst, THCDeviceTensor<float, 3> uy_dst,
+    THCDeviceTensor<float, 3> uz_dst) {
+  const int i = threadIdx.x + blockIdx.x * blockDim.x;
+  const int j = blockIdx.y;  // U-slice, i.e. Ux, Uy or Uz.
+  const int k = blockIdx.z;
+  if (i >= ux.getSize(2)) {
+    return;
+  }
+  if (geom[k][j][i] > 0.0f) {
+    // Don't advect blocked cells.
+    return;
+  }
+  // NOTE: The integer positions are in the center of the grid cells
+  const float pos[3] = {(float)i, (float)j, (float)k};  // i.e. (x, y, z)
+  
+  // Velocity is in grids / second.
+  const float vel[3] = {ux[k][j][i], uy[k][j][i],
+                        two_dim ? 0.0f : uz[k][j][i]};
+  
+  // Backtrace based upon current velocity at cell center.
+  const float displacement[3] = {-dt * vel[0], -dt * vel[1], -dt * vel[2]};
+  float back_pos[3];
+  // Step along the displacement vector. calcLineTrace will handle
+  // boundary conditions for us. Note: it will terminate BEFORE the
+  // boundary (i.e. the returned position is always valid).
+  const bool hit_boundary = calcLineTraceCUDA(pos, displacement, geom,
+                                              back_pos);
+  
+  // Check the return value from calcLineTrace just in case.
+  assert(!IsOutOfDomainReal(back_pos, geom) &&
+         !IsBlockedCellReal(obs, back_pos));
+  
+  // Finally, sample the value at the new position.
+  ux_dst[k][j][i] = sampleFieldCUDA(ux, back_pos, geom, true);
+  uy_dst[k][j][i] = sampleFieldCUDA(uy, back_pos, geom, true);
+  if (!two_dim) {
+    uz_dst[k][j][i] = sampleFieldCUDA(uz, back_pos, geom, true);
+  }
+} 
+
+// advectVelRK2 CUDA kernel.
+__global__ void kernel_advectVelRK2(
+    const float dt, THCDeviceTensor<float, 3> ux,
+    THCDeviceTensor<float, 3> uy, THCDeviceTensor<float, 3> uz,
+    THCDeviceTensor<float, 3> geom, const bool two_dim,
+    THCDeviceTensor<float, 3> ux_dst, THCDeviceTensor<float, 3> uy_dst, 
+    THCDeviceTensor<float, 3> uz_dst) {
+  const int i = threadIdx.x + blockIdx.x * blockDim.x;
+  const int j = blockIdx.y;  // U-slice, i.e. Ux, Uy or Uz.
+  const int k = blockIdx.z;
+  if (i >= ux.getSize(2)) {
+    return;
+  }
+  if (geom[k][j][i] > 0.0f) {
+    // Don't advect blocked cells.
+    return;
+  }
+  // NOTE: The integer positions are in the center of the grid cells
+  const float pos[3] = {(float)i, (float)j, (float)k};  // i.e. (x, y, z)
+  // Velocity is in grids / second.
+  float vel[3] = {ux[k][j][i], uy[k][j][i], two_dim ? 0.0f : uz[k][j][i]};
+  // Backtrace a half step based upon current velocity at cell center.
+  float displacement[3] = {0.5f * (-dt) * vel[0],
+                           0.5f * (-dt) * vel[1],
+                           0.5f * (-dt) * vel[2]};
+  float half_pos[3];
+  // Step along the displacement vector. calcLineTrace will handle
+  // boundary conditions for us. Note: it will terminate BEFORE the
+  // boundary (i.e. the returned position is always valid).
+  const bool hit_boundary_half = calcLineTraceCUDA(pos, displacement, geom,
+                                                   half_pos);
+  // Check the return value from calcLineTrace just in case.
+  assert(!IsOutOfDomainReal(half_pos, geom) &&
+         !IsBlockedCellReal(obs, half_pos));
+  if (hit_boundary_half) {
+    // We hit the boundary, then as per Bridson, we should clamp the
+    // backwards trace. Note: if we treated this as a full euler step, we 
+    // would have hit the same blocker because the line trace is linear.
+    // TODO(tompson,kris): I'm pretty sure this is the best we could do
+    // but I still worry about numerical stability.
+    ux_dst[k][j][i] = sampleFieldCUDA(ux, half_pos, geom, true);
+    uy_dst[k][j][i] = sampleFieldCUDA(uy, half_pos, geom, true);
+    if (!two_dim) {
+      uz_dst[k][j][i] = sampleFieldCUDA(uz, half_pos, geom, true);
+    }
+    return;
+  }
+
+  // Sample the velocity at this half step location.
+  // Note: dereferencing a 4D tensor returns a detail::THCDeviceSubTensor<...>
+  // instance, NOT a THCDeviceTensor instance. We therefore need to create
+  // new view instances (using the view function).
+  vel[0] = sampleFieldCUDA(ux, half_pos, geom, true);
+  vel[1] = sampleFieldCUDA(uy, half_pos, geom, true);
+  vel[2] = two_dim ? 0.0f : sampleFieldCUDA(uz, half_pos, geom, true);
+  // Do another line trace using this half position's velocity.
+  float back_pos[3];
+  displacement[0] = -dt * vel[0];
+  displacement[1] = -dt * vel[1];
+  displacement[2] = -dt * vel[2];
+  const bool hit_boundary = calcLineTraceCUDA(pos, displacement, geom,
+                                              back_pos);
+  // Again, check the return value from calcLineTrace just in case.
+  assert(!IsOutOfDomainReal(back_pos, geom) &&
+         !IsBlockedCellReal(obs, back_pos));
+  // Sample the value at the new position.
+  ux_dst[k][j][i] = sampleFieldCUDA(ux, back_pos, geom, true);
+  uy_dst[k][j][i] = sampleFieldCUDA(uy, back_pos, geom, true);
+  if (!two_dim) {
+    uz_dst[k][j][i] = sampleFieldCUDA(uz, back_pos, geom, true);
+  }
+}
+
+static int tfluids_CudaMain_advectVel(lua_State *L) {
+  THCState* state = cutorch_getstate(L);
+
+  const float dt = (float)(lua_tonumber(L, 1));
+  THCudaTensor* u = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 2, "torch.CudaTensor"));
+  THCudaTensor* geom = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 3, "torch.CudaTensor"));
+  THCudaTensor* u_dst = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 4, "torch.CudaTensor"));
+  const std::string method = static_cast<std::string>(lua_tostring(L, 5));
+  
+  if (u->nDimension != 4 || geom->nDimension != 3 || u_dst->nDimension != 4) {
+    luaL_error(L, "Incorrect dimensions.");
+  }
+  const bool two_dim = u->size[0] == 2;
+  if (u->size[0] != u_dst->size[0]) {
+    luaL_error(L, "u and u_dst size mismatch.");
+  }
+
+  THCDeviceTensor<float, 4> dev_u = toDeviceTensor<float, 4>(state, u);
+  THCDeviceTensor<float, 3> dev_geom = toDeviceTensor<float, 3>(state, geom);
+  THCDeviceTensor<float, 4> dev_u_dst = toDeviceTensor<float, 4>(state, u_dst);
+
+  // One "thread" per output grid element (i.e. d * h * w).
+  int nplane = dev_u_dst.getSize(3);
+  dim3 grid_size(THCCeilDiv(nplane, 256), dev_u_dst.getSize(2),
+                 dev_u_dst.getSize(1));  // (x, y, z)
+  dim3 block_size(nplane > 256 ? 256 : nplane);
+
+  // We have to dereference the 4D u tensors into x, y, and z components.
+  // The reason for this is that dereferencing these in the kernel results in
+  // THCDeviceSubTensor instances, which then cannot be passed to our sampling
+  // function (which expects THCDeviceTensors only). Unfortunately, the view
+  // method is host only, so we have to perform it here.
+  THCDeviceTensor<float, 3> dev_ux = dev_u[0].view();
+  THCDeviceTensor<float, 3> dev_uy = dev_u[1].view();
+  // Note, if two_dim is true, we will set the z channel to an empty tensor.
+  THCDeviceTensor<float, 3> dev_uz =
+      two_dim ? THCDeviceTensor<float, 3>() : dev_u[2].view();
+  THCDeviceTensor<float, 3> dev_ux_dst = dev_u_dst[0].view();
+  THCDeviceTensor<float, 3> dev_uy_dst = dev_u_dst[1].view();
+  THCDeviceTensor<float, 3> dev_uz_dst =
+      two_dim ? THCDeviceTensor<float, 3>() : dev_u_dst[2].view();
+
+  if (method == "rk2") {
+    kernel_advectVelRK2<<<grid_size, block_size, 0,
+                          THCState_getCurrentStream(state)>>>(
+        dt, dev_ux, dev_uy, dev_uz, dev_geom, two_dim, dev_ux_dst,
+        dev_uy_dst, dev_uz_dst);
+  } else if (method == "euler") {
+    kernel_advectVelEuler<<<grid_size, block_size, 0,
+                            THCState_getCurrentStream(state)>>>(
+        dt, dev_ux, dev_uy, dev_uz, dev_geom, two_dim, dev_ux_dst,
+        dev_uy_dst, dev_uz_dst);
+  } else if (method == "maccormack") {
+    luaL_error(L, "maccormack not yet implemented.");
+  } else {
+    luaL_error(L, "Invalid advection method.");
+  }
+
+  return 0;  
+}
+
+//******************************************************************************
+// INIT METHODS
+//******************************************************************************
+
 static const struct luaL_Reg tfluids_CudaMain__ [] = {
   {"averageBorderCells", tfluids_CudaMain_averageBorderCells},
   {"setObstacleBcs", tfluids_CudaMain_setObstacleBcs},
@@ -1092,6 +2182,8 @@ static const struct luaL_Reg tfluids_CudaMain__ [] = {
   {"calcVelocityDivergenceBackward",
    tfluids_CudaMain_calcVelocityDivergenceBackward},
   {"solveLinearSystemPCG", tfluids_CudaMain_solveLinearSystemPCG},
+  {"advectScalar", tfluids_CudaMain_advectScalar},
+  {"advectVel", tfluids_CudaMain_advectVel},
   {NULL, NULL}  // NOLINT
 };
 

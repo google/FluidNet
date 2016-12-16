@@ -36,6 +36,7 @@ function torch.defaultConf()
     -- arc | bunny'
     loadVoxelModel = 'none',
     maxEpochs = 500,  -- Maximum number of epochs
+    maxSamplesPerEpoch = math.huge,  -- For debugging.
     modelDir = '../data/models/',
     modelFilename = 'conv_model',  -- Output model file name
     newModel = {
@@ -108,7 +109,7 @@ function torch.defaultConf()
       vorticityConfinementAmp = 0.05,
     },
     profile = false,  -- Requires ProFi.
-    profileFPROPTime = 10,  -- Set to zero to disable profiling on startup.
+    profileFPROPTime = 0,  -- In sec. Set to zero to disable profiling.
     resumeTraining = false,
     train = true,  -- perform training (otherwise just evaluate)
     trainPerturb = {

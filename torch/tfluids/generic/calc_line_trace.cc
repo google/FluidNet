@@ -41,11 +41,12 @@ static inline void GetPixelCenter(const tfluids_(vec3)& pos, int32_t* ix,
 static inline bool IsOutOfDomainReal(const tfluids_(vec3)& pos,
                                      const Int3& dim) {
   return (pos.x <= static_cast<real>(-0.5) ||  // LHS of grid cell.
-          pos.x >= static_cast<real>(dim.x - 0.5) ||  // RHS of grid cell.
+          // RHS of grid cell.
+          pos.x >= (static_cast<real>(dim.x) - static_cast<real>(0.5)) ||
           pos.y <= static_cast<real>(-0.5) ||
-          pos.y >= static_cast<real>(dim.y - 0.5) ||
+          pos.y >= (static_cast<real>(dim.y) - static_cast<real>(0.5)) ||
           pos.z <= static_cast<real>(-0.5) ||
-          pos.z >= static_cast<real>(dim.z - 0.5));
+          pos.z >= (static_cast<real>(dim.z) - static_cast<real>(0.5)));
 }
 
 static inline bool IsBlockedCell(const real* obs, int32_t i, int32_t j,
@@ -374,7 +375,7 @@ bool calcLineTrace(const tfluids_(vec3)& pos, const tfluids_(vec3)& delta,
         // training. It happens because either the ray is almost parallel
         // to the domain boundary, OR floating point round-off causes the
         // intersection test to fail.
-        printf("WARNING: Ray-border intersection failed.\n");
+        
         // In this case, fall back to simply clamping next_pos inside the domain
         // boundary. It's not ideal, but better than a hard failure.
         ipos.x = next_pos.x;
@@ -443,11 +444,11 @@ bool calcLineTrace(const tfluids_(vec3)& pos, const tfluids_(vec3)& delta,
         // Hard assert if we didn't hit (even on release builds) because we
         // should have hit the aabbox!
         if (!hit) {
-          // This can happen in very rare cases if the ray box intersection
-          // test fails because of floating point round off.
+          // EDIT: This can happen in very rare cases if the ray box
+          // intersection test fails because of floating point round off.
           // It can also happen if the simulation becomes unstable (maybe with a
           // poorly trained model) and the velocity values are extremely high.
-          printf("WARNING: Ray-box intersection failed.\n");
+          
           // In this case, fall back to simply returning new_pos (for which the
           // loop invariant guarantees is a valid point).
           next_pos.x = new_pos.x;

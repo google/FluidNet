@@ -59,7 +59,11 @@ function torch.runEpoch(input)
     dataInds = torch.range(1, data:nsamples())
   end
 
-  -- dataInds = {unpack(dataInds, 1, 6 * conf.batchSize)}
+  -- For fast debugging, we can reduce the epoch size to n batches.
+  if conf.maxSamplesPerEpoch < math.huge then
+    local nsamples = math.min(#dataInds, conf.maxSamplesPerEpoch)
+    dataInds = {unpack(dataInds, 1, nsamples)}
+  end
 
   -- Containers for the current batch, the CPU storage gets filled and then
   -- transferred in one shot to the GPU.
@@ -198,7 +202,7 @@ function torch.runEpoch(input)
 
         for i = 1, numFutureSteps do
           local outputDiv = (i == numFutureSteps)
-          tfluids.simulate(conf, mconf, batchCPU, batchGPU, model, outputDiv)
+          tfluids.simulate(conf, mconf, batchGPU, model, outputDiv)
         end
         torch.setDropoutTrain(model, training)
        

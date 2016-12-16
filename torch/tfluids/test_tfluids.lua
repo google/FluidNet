@@ -27,6 +27,7 @@ torch.setnumthreads(8)
 
 -- Create an instance of the test framework
 local precision = 1e-5
+local loosePrecision = 2e-4
 local mytester = torch.Tester()
 local test = torch.TestSuite()
 local times = {}
@@ -74,7 +75,7 @@ local function profileCuda(func, name, args)
   local tm = {}
   times[name] = tm
 
-  -- Profile CPU.
+  -- Profile CPU (convert tensors to float for a fair comparison).
   for key, value in pairs(args) do
     if torch.isTensor(value) then
       args[key] = value:float()
@@ -143,8 +144,8 @@ function test.vorticityConfinementCUDA()
   local d = {1, 1, torch.random(32, 64), torch.random(32, 64)}
   local w = torch.random(32, 64)
   local h = torch.random(32, 64)
-  local scale = torch.rand(1)[1]  -- in [0, 1]
-  local dt = torch.rand(1)[1]  -- in [0, 1]
+  local scale = torch.uniform(0.5, 1)  -- in [0.5, 1]
+  local dt = torch.uniform(0.5, 1)
   local case = {'2D', '2DGEOM', '3D', '3DGEOM'}
   local incGeom = {false, true, false,  true}
 
@@ -257,6 +258,101 @@ function test.calcVelocityUpdateCUDA()
   end
 end
 
+function test.advectScalarCUDA()
+  -- Test that the float and cuda implementations are the same.
+  for sampleIntoGeom = 0, 1 do
+    for dim = 2, 3 do
+      local dt = torch.uniform(0.5, 1)
+      local d
+      if dim == 2 then
+        d = 1
+      else
+        d = torch.random(32, 64)
+      end
+      local h = torch.random(32, 64)
+      local w = torch.random(32, 64)
+      local methods = {'euler', 'rk2'}
+ 
+      local p = torch.rand(d, h, w):float()
+      -- Mul rand by 10 to get reasonable coverage over multiple cells.
+      local u = torch.rand(dim, d, h, w):mul(5):float()
+      local geom = torch.rand(d, h, w):gt(0.8):float()
+
+      p:cmul(1 - geom)  -- Zero out geometry cells.
+  
+      for _, method in pairs(methods) do
+        local caseStr = ('advectScalar - method: ' .. method .. ', dim: ' ..
+                         dim .. ', sampleIntoGeom: ' .. sampleIntoGeom)
+  
+        -- Perform advection on the CPU.
+        local pDst = p:clone():fill(0)
+        tfluids.advectScalar(dt, p, u, geom, pDst, method,
+                             sampleIntoGeom == 1)
+  
+        -- Perform advection on the GPU.
+        local pDstGPU = p:clone():fill(0):cuda()
+        tfluids.advectScalar(dt, p:cuda(), u:cuda(), geom:cuda(), pDstGPU,
+                             method, sampleIntoGeom == 1)
+        
+        local maxErr = (pDst - pDstGPU:float()):abs():max()
+        -- TODO(tompson): It's troubling that we need loose precision here.
+        -- Maybe it's OK, but it is never-the-less surprising.
+
+        -- NOTE: This might actually fail sometimes (rarely, but I've seen
+        -- it happen). This is because floating point roundoff can cause rays
+        -- to brush past geometry cells but not actually trigger intersections. 
+        mytester:assertlt(maxErr, loosePrecision, 'ERROR: ' .. caseStr)
+
+        profileCuda(tfluids.advectScalar, caseStr,
+                    {dt, p, u, geom, pDst, method, sampleIntoGeom == 1})
+      end
+    end
+  end
+end
+
+function test.advectVelCUDA()
+  -- Test that the float and cuda implementations are the same.
+  for dim = 2, 3 do
+    local dt = torch.uniform(0.5, 1)
+    local d
+    if dim == 2 then
+      d = 1
+    else
+      d = torch.random(32, 64)
+    end
+    local h = torch.random(32, 64)
+    local w = torch.random(32, 64)
+    local methods = {'euler', 'rk2'}  
+
+    -- Mul rand by 10 to get reasonable coverage over multiple cells.
+    local u = torch.rand(dim, d, h, w):mul(5):float()
+    local geom = torch.rand(d, h, w):gt(0.8):float()
+
+    for _, method in pairs(methods) do
+      local caseStr = ('advectVel - method: ' .. method .. ', dim: ' .. dim)
+
+      -- Perform advection on the CPU.
+      local uDst = u:clone():fill(0) 
+      tfluids.advectVel(dt, u, geom, uDst, method)
+
+      -- Perform advection on the GPU.
+      local uDstGPU = u:clone():fill(0):cuda()
+      tfluids.advectVel(dt, u:cuda(), geom:cuda(), uDstGPU, method)
+      
+      local maxErr = (uDst - uDstGPU:float()):abs():max()
+      -- TODO(tompson): It's troubling that we need loose precision here.
+      -- Maybe it's OK, but it is never-the-less surprising.
+
+      -- NOTE: This might actually fail sometimes (rarely, but I've seen
+      -- it happen). This is because floating point roundoff can cause rays
+      -- to brush past geometry cells but not actually trigger intersections. 
+      mytester:assertlt(maxErr, loosePrecision, 'ERROR: ' .. caseStr)
+
+      profileCuda(tfluids.advectVel, caseStr, {dt, u, geom, uDst, method})
+    end
+  end
+end
+
 --[[
 function test.solveLinearSystemPCGCUDA()
   local batchSize = torch.random(1, 3)
@@ -344,6 +440,7 @@ function test.interpField()
   local d = torch.random(8, 16)
   local h = torch.random(8, 16)
   local w = torch.random(8, 16)
+  local eps = 1e-6
 
   local geom = torch.zeros(d, h, w)
   local field = torch.rand(d, h, w)
@@ -359,7 +456,7 @@ function test.interpField()
   mytester:asserteq(val, field[{-1, -1, -1}], 'Bad interp value')
   
   -- The corner of the grid should also be the center of the first cell.
-  pos = torch.Tensor({-0.5, -0.5, -0.5})
+  pos = torch.Tensor({-0.5 + eps, -0.5 + eps, -0.5 + eps})
   val = tfluids.interpField(field, geom, pos)
   mytester:asserteq(val, field[{1, 1, 1}], 'Bad interp value')
 

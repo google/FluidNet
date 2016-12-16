@@ -44,13 +44,11 @@ if file ~= nil then
   torch.load = function(filename)
     assert(file.Exists(filename))
     local object = file.LoadObject(filename)
-    collectgarbage()
     return object
   end
 
   torch.save = function(filename, data)
     file.SaveObject(filename, data)
-    collectgarbage()
   end
 
   paths.filep = function(filename)

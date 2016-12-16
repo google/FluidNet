@@ -62,7 +62,7 @@ function torch.calcStats(input)
 
     for j = 2, nSteps do
       local outputDiv = false
-      tfluids.simulate(conf, mconf, batchCPU, batchGPU, model, outputDiv)
+      tfluids.simulate(conf, mconf, batchGPU, model, outputDiv)
       local p, U, geom, density =
           tfluids.getPUGeomDensityReference(batchGPU)
       div = divNet:forward({U, geom})

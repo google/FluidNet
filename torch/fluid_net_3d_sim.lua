@@ -155,7 +155,7 @@ for i = 1, numFrames do
   collectgarbage()
   print('Simulating frame ' .. i .. ' of ' .. numFrames)
   
-  tfluids.simulate(conf, mconf, batchCPU, batchGPU, model, false)
+  tfluids.simulate(conf, mconf, batchGPU, model, false)
   -- Result is now on the GPU.
 
   local p, U, geom, density = tfluids.getPUGeomDensityReference(batchGPU)
