@@ -53,21 +53,34 @@ function torch.runEpoch(input)
   local dataInds
   if training then
     -- When training, shuffle the indices. 
-    dataInds = torch.randperm(data:nsamples()):totable()
+    dataInds = torch.randperm(data:nsamples()):int()
   else
     -- When testing, go through the dataset in order.
-    dataInds = torch.range(1, data:nsamples())
+    dataInds = torch.IntTensor(torch.range(1, data:nsamples()))
   end
 
-  -- For fast debugging, we can reduce the epoch size to n batches.
+  -- For fast debugging, we can reduce the epoch size.
   if conf.maxSamplesPerEpoch < math.huge then
     local nsamples = math.min(#dataInds, conf.maxSamplesPerEpoch)
-    dataInds = {unpack(dataInds, 1, nsamples)}
+    dataInds = dataInds[{{1, nsamples}}]
   end
 
   -- Containers for the current batch, the CPU storage gets filled and then
   -- transferred in one shot to the GPU.
-  local batchCPU, batchGPU = data:AllocateBatchMemory(conf, mconf)
+  local batchGPU = data:cloneBatchToGPU(
+      data:AllocateBatchMemory(conf.batchSize, conf, mconf))
+
+  -- Create a parallel data container to synchronously create batches (very
+  -- important for the 2D model since diskIO becomes the bottleneck).
+  local function initThreadFunc()
+    -- Recall: All threads must be initialized with all classes and packages.
+    require('torch')
+    require('tfluids')
+    dofile('lib/load_package_safe.lua')
+    dofile('lib/data_binary.lua')
+  end
+  local parallel = torch.DataParallel(conf.numDataThreads, data, dataInds,
+                                      conf.batchSize, initThreadFunc)
 
   local batchGradNorm = {}
 
@@ -92,7 +105,8 @@ function torch.runEpoch(input)
         '] [learnRate = ' .. mconf.optimState.learningRate ..
         '] [optim = '.. mconf.optimizationMethod .. ']')
   io.flush()
-  local nbatches = 0
+  local nbatches = 0  -- Number processed
+  local nbatchesTotal = math.ceil(dataInds:size(1) / conf.batchSize)
   local aveLoss = 0
   local avePLoss = 0
   local aveULoss = 0
@@ -101,7 +115,12 @@ function torch.runEpoch(input)
   local lastBatchErr = nil
   local batchErr = {}  -- A list of batch indices and the crit err
   local time
-  for t = 1, #dataInds, conf.batchSize do
+  local processedSamples = {}  -- Hash set of samples we've processed.
+
+  assert(not parallel:empty(), 'No batches to train / eval on!')
+
+  repeat
+    -- Get a processed batch.
     if math.fmod(nbatches, 10) == 0 then
       collectgarbage()
     end
@@ -109,25 +128,29 @@ function torch.runEpoch(input)
     if lastBatchErr ~= nil then
       progress_str = string.format('err=%.4e', lastBatchErr)
     end
-    torch.progress(t, #dataInds, progress_str)
+    torch.progress(nbatches, nbatchesTotal, progress_str)
 
-    local imgList = {}  -- list of images in the current batch
-    for i = t, math.min(math.min(t + conf.batchSize - 1, data:nsamples()),
-                        #dataInds) do
-      table.insert(imgList, dataInds[i])
+    -- Get a processed batch. NOTE: they may be out of order since we
+    -- process them asynchronously. We only perturb during training.
+    local perturbData = conf.trainPerturb.on and training
+    local batch = parallel:getBatch(conf, mconf, perturbData)
+
+    -- Check we don't double count any samples. This is technically tested
+    -- in test_data_parallel.lua, but do it again here just in case.
+    local batchSet = batch.batchSet  -- Index set for the current batch.
+    for i = 1, batchSet:size(1) do
+      assert(processedSamples[batchSet[i]] == nil, 'Double counting sample!')
+      processedSamples[batchSet[i]] = true
     end
+
+    -- Sync the batch to the GPU.
+    data:syncBatchToGPU(batch.data, batchGPU) 
 
     -- The first batch is not representative of processing time, don't include
     -- it (this is because lots of mallocs happen on the first batch).
-    if t > 1 and time == nil then
+    if time == nil then
       time = sys.clock()
     end
-
-    -- Create mini-batch.
-    -- Note: We only perturb when training.
-    local perturbData = conf.trainPerturb.on and training
-    local degRot, scale, transVPix, transUPix, flipX, flipY, flipZ =
-      data:CreateBatch(batchCPU, batchGPU, conf, mconf, imgList, perturbData)
 
     -- create closure to evaluate f(X) and df/dX
     local feval = function(x)
@@ -261,8 +284,15 @@ function torch.runEpoch(input)
     end
 
     nbatches = nbatches + 1
+  until parallel:empty()
+  
+  -- Make sure we processed every single sample we meant to.
+  assert(nbatches == nbatchesTotal)
+  for i = 1, dataInds:size(1) do
+    assert(processedSamples[dataInds[i]])
   end
-  torch.progress(#dataInds, #dataInds)
+
+  torch.progress(dataInds:size(1), dataInds:size(1))
 
   saveBatchGrad()
 

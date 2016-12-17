@@ -74,7 +74,6 @@ end
 
 dofile('lib/misc_tools.lua')
 dofile('lib/pbar.lua')
--- dofile('lib/data.lua')  -- PHYSBAM Data class.  Defunct for now.
 dofile('lib/data_binary.lua')
 dofile('lib/run_epoch.lua')
 dofile('lib/model.lua')
@@ -106,6 +105,7 @@ end
 if optim.rmsprop == nil then
   dofile('lib/rmsprop.lua')
 end
+dofile('lib/data_parallel.lua')
 
 torch.setdefaulttensortype('torch.FloatTensor')
 torch.setnumthreads(8)

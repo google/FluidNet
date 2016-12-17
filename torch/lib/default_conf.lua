@@ -108,6 +108,7 @@ function torch.defaultConf()
       -- Set to 0 to disable vorticity confinement.
       vorticityConfinementAmp = 0.05,
     },
+    numDataThreads = 8,  -- To amortize the cost of data loading / processing.
     profile = false,  -- Requires ProFi.
     profileFPROPTime = 0,  -- In sec. Set to zero to disable profiling.
     resumeTraining = false,

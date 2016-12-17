@@ -1261,6 +1261,7 @@ function torch.deepClone(x, retType)
   elseif xType == 'string' or xType == 'boolean' or xType == 'number' then
     ret = x
   else
+    assert(torch.type(x) == 'table')
     ret = {}
     for key, val in pairs(x) do
       ret[key] = torch.deepClone(val, retType) end

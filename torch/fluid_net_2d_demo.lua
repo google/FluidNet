@@ -95,9 +95,9 @@ local numColors = #colors
 function tfluids.loadData()
   local imgList = {torch.random(1, tr:nsamples())}
   print('Using image: ' .. imgList[1])
-  batchCPU, batchGPU = tr:AllocateBatchMemory(conf, mconf)
+  batchCPU, batchGPU = tr:AllocateBatchMemory(conf.batchSize, conf, mconf)
   local perturb = false
-  tr:CreateBatch(batchCPU, batchGPU, conf, mconf, imgList, perturb)
+  tr:CreateBatch(batchCPU, torch.IntTensor(imgList), conf, mconf, perturb)
   assert(tr.twoDim, 'Density needs updating to 3D')
   -- Pick a new density each time.
   densityType = math.fmod(densityType + 1, 5)

@@ -418,10 +418,17 @@ function DataBinary:visualizeBatch(conf, mconf, imgList, depth)
   end
   depth = depth or 1
 
-  local batchCPU, batchGPU = self:AllocateBatchMemory(conf, mconf)
+  local batchCPU = self:AllocateBatchMemory(conf.batchSize, conf, mconf)
+  local batchGPU = self:cloneBatchToGPU(batchCPU)
+
   local perturb = conf.trainPerturb.on
   local degRot, scale, transVPix, transUPix, flipX, flipY, flipZ =
-    self:CreateBatch(batchCPU, batchGPU, conf, mconf, imgList, perturb)
+    self:CreateBatch(batchCPU, torch.IntTensor(imgList), conf, mconf, perturb)
+
+  -- Just for testing purposes, also call a sync on the CPU --> GPU to replicate
+  -- what we do during training (i.e. tests sync).
+  self:syncBatchToGPU(batchCPU, batchGPU)
+
 
   print('    Image set:')  -- Don't print if this is used in the train loop.
   for i = 1, #imgList do
@@ -460,7 +467,17 @@ function DataBinary:visualizeBatch(conf, mconf, imgList, depth)
   return batchCPU, batchGPU
 end
 
-function DataBinary:AllocateBatchMemory(conf, mconf)
+function DataBinary:AllocateBatchMemory(batchSize, ...)
+  collectgarbage()  -- Clean up thread memory.
+
+  -- Unpack variable args.
+  local args = {...}
+  local conf = args[1]
+  local mconf = args[2]
+  assert(conf ~= nil and mconf ~= nil)
+
+  assert(batchSize == conf.batchSize)  -- Sanity check
+
   -- Create the data containers.
   local d = self.zdim
   local h = self.ydim
@@ -481,9 +498,7 @@ function DataBinary:AllocateBatchMemory(conf, mconf)
   batchCPU.UTarget = batchCPU.UDiv:clone()
   batchCPU.geom = torch.FloatTensor(conf.batchSize, 1, d, h, w):normal()
 
-  local batchGPU = torch.deepClone(batchCPU, 'torch.CudaTensor')
-
-  return batchCPU, batchGPU
+  return batchCPU
 end
 
 local function downsampleImagesBy2(dst, src)
@@ -513,8 +528,16 @@ end
 
 -- CreateBatch fills already preallocated data structures.  To be used in a
 -- training loop where the memory is allocated once and reused.
-function DataBinary:CreateBatch(batchCPU, batchGPU, conf, mconf, imgList,
-                                perturb)
+function DataBinary:CreateBatch(batchCPU, sampleSet, ...)
+  -- Unpack variable length args.
+  local args = {...}
+  local conf = args[1]
+  local mconf = args[2]
+  local perturb = args[3]
+  assert(conf ~= nil and mconf ~= nil and perturb ~= nil)
+
+  assert(sampleSet:size(1) <= conf.batchSize)  -- sanity check.
+
   assert(mconf.netDownsample == 1, "pooling not supported")
   if perturb == nil then
     perturb = false
@@ -532,8 +555,6 @@ function DataBinary:CreateBatch(batchCPU, batchGPU, conf, mconf, imgList,
   assert(self.twoDim == mconf.twoDim,
          'Mixing 3D model with 2D data or vice-versa!')
 
-  -- I used to pre-allocate these, but the code is much more redable if we just
-  -- allocate them every time CreateBatch is called
   local degRot = torch.FloatTensor(conf.batchSize)
   local scale = torch.FloatTensor(conf.batchSize)
   local transUPix = torch.FloatTensor(conf.batchSize)
@@ -558,9 +579,9 @@ function DataBinary:CreateBatch(batchCPU, batchGPU, conf, mconf, imgList,
   flipZ:fill(0)
 
   -- create mini batch
-  for i = 1, #imgList do
+  for i = 1, sampleSet:size(1) do
     -- For each image in the batch list
-    local isample = imgList[i]
+    local isample = sampleSet[i]
     assert(isample >= 1 and isample <= self:nsamples())
     local irun = self.samples[isample][1]
     local if1 = self.samples[isample][2]
@@ -664,15 +685,26 @@ function DataBinary:CreateBatch(batchCPU, batchGPU, conf, mconf, imgList,
     batchCPU.UTarget[i]:copy(UTarget)
   end
 
-  -- Copy the data to the GPU in one (asynchronous) copy
-  if batchGPU ~= nil then
-    for key, value in pairs(batchCPU) do
-      assert(batchGPU[key] ~= nil)
+  return degRot, scale, transVPix, transUPix, flipX, flipY, flipZ
+end
+
+-- Deep-copy all batch data from the CPU to the GPU.
+function DataBinary:syncBatchToGPU(batchCPU, batchGPU)
+  assert(type(batchCPU) == 'table' and type(batchGPU) == 'table')
+  for key, value in pairs(batchCPU) do
+    assert(batchGPU[key] ~= nil)
+    if type(value) == 'table' then
+      syncBatchToGPU(batchGPU[key], value)  -- recurse on sub-tables.
+    else
+      assert(torch.isTensor(value))
       batchGPU[key]:copy(value)
     end
   end
+end
 
-  return degRot, scale, transVPix, transUPix, flipX, flipY, flipZ
+-- Create a deep-copy of batchCPU on the GPU.
+function DataBinary:cloneBatchToGPU(batchCPU)
+  return  torch.deepClone(batchCPU, 'torch.CudaTensor')
 end
 
 function DataBinary:nsamples()

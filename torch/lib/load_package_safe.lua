@@ -15,7 +15,6 @@
 function torch.loadPackageSafe(package_name)
   local res, lib = pcall(require, package_name)
   if res == false then
-    print('WARNING: could not load ' .. package_name)
     return nil
   end
   return lib
