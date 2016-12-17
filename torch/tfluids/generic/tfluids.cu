@@ -102,7 +102,7 @@ __device__ __forceinline__ bool IsBlockedCell(
     const THCDeviceTensor<float, 3>& geom, int i, int j, int k) {
   // Returns true if the cell is blocked.
   // Shouldn't be called on point outside the domain.
-  assert(!tfluids_(IsOutOfDomain)(i, j, k, geom));
+  assert(!IsOutOfDomain(i, j, k, geom));
   return geom[k][j][i] == 1.0f;
 }
 
@@ -1709,7 +1709,7 @@ __device__ __forceinline__ float GetInterpValueCUDA(
          kcoef >= 0 && kcoef <= 1);
 
   // Interpolation coordinates should be in the domain.
-  assert(!IsOutOfDomain(i0, j0, k0, dims) && !IsOutOfDomain(i1, j1, k1, dims));
+  assert(!IsOutOfDomain(i0, j0, k0, obs) && !IsOutOfDomain(i1, j1, k1, obs));
 
   // Note: we DO NOT need to handle geometry when doing the trilinear
   // interpolation:
@@ -1840,7 +1840,7 @@ __global__ void kernel_advectScalarEuler(
   
   // Check the return value from calcLineTrace just in case.
   assert(!IsOutOfDomainReal(back_pos, geom) &&
-         !IsBlockedCellReal(obs, back_pos));
+         !IsBlockedCellReal(geom, back_pos));
   
   // Finally, sample the value at the new position.
   p_dst[k][j][i] = sampleFieldCUDA(p, back_pos, geom, sample_into_geom);
@@ -1883,7 +1883,7 @@ __global__ void kernel_advectScalarRK2(
 
   // Check the return value from calcLineTrace just in case.
   assert(!IsOutOfDomainReal(half_pos, geom) &&
-         !IsBlockedCellReal(obs, half_pos));
+         !IsBlockedCellReal(geom, half_pos));
 
   if (hit_boundary_half) {
     // We hit the boundary, then as per Bridson, we should clamp the
@@ -1913,7 +1913,7 @@ __global__ void kernel_advectScalarRK2(
 
   // Again, check the return value from calcLineTrace just in case.
   assert(!IsOutOfDomainReal(back_pos, geom) &&
-         !IsBlockedCellReal(obs, back_pos));
+         !IsBlockedCellReal(geom, back_pos));
 
   // Sample the value at the new position.
   p_dst[k][j][i] = sampleFieldCUDA(p, back_pos, geom, sample_into_geom);
@@ -2021,7 +2021,7 @@ __global__ void kernel_advectVelEuler(
   
   // Check the return value from calcLineTrace just in case.
   assert(!IsOutOfDomainReal(back_pos, geom) &&
-         !IsBlockedCellReal(obs, back_pos));
+         !IsBlockedCellReal(geom, back_pos));
   
   // Finally, sample the value at the new position.
   ux_dst[k][j][i] = sampleFieldCUDA(ux, back_pos, geom, true);
@@ -2064,7 +2064,7 @@ __global__ void kernel_advectVelRK2(
                                                    half_pos);
   // Check the return value from calcLineTrace just in case.
   assert(!IsOutOfDomainReal(half_pos, geom) &&
-         !IsBlockedCellReal(obs, half_pos));
+         !IsBlockedCellReal(geom, half_pos));
   if (hit_boundary_half) {
     // We hit the boundary, then as per Bridson, we should clamp the
     // backwards trace. Note: if we treated this as a full euler step, we 
@@ -2095,7 +2095,7 @@ __global__ void kernel_advectVelRK2(
                                               back_pos);
   // Again, check the return value from calcLineTrace just in case.
   assert(!IsOutOfDomainReal(back_pos, geom) &&
-         !IsBlockedCellReal(obs, back_pos));
+         !IsBlockedCellReal(geom, back_pos));
   // Sample the value at the new position.
   ux_dst[k][j][i] = sampleFieldCUDA(ux, back_pos, geom, true);
   uy_dst[k][j][i] = sampleFieldCUDA(uy, back_pos, geom, true);

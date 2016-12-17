@@ -59,7 +59,7 @@ function torch.calcVelocityUpdate(deltaU, p, geom, matchManta)
                 deltaU[{dim, pos[3], pos[2], pos[1]}] =
                     p[{pos[3], pos[2], pos[1]}] * 0.5
               else
-                deltaU[{dim, pos[3], pos[2], pos[1]}] = 
+                deltaU[{dim, pos[3], pos[2], pos[1]}] =
                     p[{posPos[3], posPos[2], posPos[1]}] * 0.5
               end
               return

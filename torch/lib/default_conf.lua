@@ -25,7 +25,7 @@ function torch.defaultConf()
     batchSize = 16,  -- Definitely depends heavily on model and dataset
     dataDir = '../data/datasets/',  -- Where the unprocessed data is stored.
     dataset = 'output_current_model_sphere',  -- Default: 2D with geometry.
-    gpu = 1,  -- Cuda GPU to use 
+    gpu = 1,  -- Cuda GPU to use
     ignoreFrames = 0,  -- Ignore the first 'n' frames of each run
     -- lrEpochMults: pairs of {epoch, multiplier}. We will
     -- apply the specified multiplier to the learning rate at each epoch. E.g.
@@ -68,7 +68,7 @@ function torch.defaultConf()
       gradNormThreshold = 1,
       -- inputPToPModel: if true input pDiv to ConvNet that will perform the
       -- pressure divergence.
-      inputPToPModel = true, 
+      inputPToPModel = true,
       lossFunc = 'fluid',  -- Only fluid is supported for now.
       lossFuncScaleInvariant = false,  -- If true then use Eigen's scale inv MSE
       lossPLambda = 1,

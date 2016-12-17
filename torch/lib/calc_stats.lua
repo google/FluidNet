@@ -27,8 +27,7 @@ function torch.calcStats(input)
   torch.setDropoutTrain(model, false)
   local dataInds = torch.range(1, data:nsamples())
 
-  local batchCPU, batchGPU = data:AllocateBatchMemory(conf.batchSize, conf,
-                                                      mconf)
+  local batchCPU, batchGPU = data:AllocateBatchMemory(conf.batchSize)
   local matchManta = false
   local divNet = nn.VelocityDivergence(matchManta):cuda()
 
@@ -49,8 +48,8 @@ function torch.calcStats(input)
     end
 
     local perturbData = false
-    data:CreateBatch(batchCPU, torch.IntTensor(imgList), conf, mconf,
-                     perturbData)
+    data:CreateBatch(batchCPU, torch.IntTensor(imgList), conf.batchSize,
+                     perturb, {}, mconf.netDownsample, conf.dataDir)
     local p, U, geom, density = tfluids.getPUGeomDensityReference(batchGPU)
     -- Start with the DIVERGENCE FREE frame (not advected frame).
     U:copy(batchGPU.UTarget)

@@ -1269,6 +1269,20 @@ function torch.deepClone(x, retType)
   return ret
 end
 
+-- Deep-copy all batch data from the CPU to the GPU.
+function torch.syncBatchToGPU(batchCPU, batchGPU)
+  assert(type(batchCPU) == 'table' and type(batchGPU) == 'table')
+  for key, value in pairs(batchCPU) do
+    assert(batchGPU[key] ~= nil)
+    if type(value) == 'table' then
+      syncBatchToGPU(batchGPU[key], value)  -- recurse on sub-tables.
+    else
+      assert(torch.isTensor(value))
+      batchGPU[key]:copy(value)
+    end
+  end
+end
+
 -- Like doing a X(1:stride:end) along a certain dimension in matlab.
 function strideTensor(tensor, dim, stride)
   assert(tensor:dim() >= dim)

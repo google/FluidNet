@@ -17,11 +17,6 @@
 -- TODO(tompson): This needs a huge cleanup.
 
 local mattorch = torch.loadPackageSafe('mattorch')
-local tfluids = torch.loadPackageSafe('tfluids')
-if tfluids == nil then
-  tfluids = {}
-  torch.makeGlobal('tfluids', tfluids)
-end
 local torchzlib = torch.loadPackageSafe('torchzlib')
 local torchzfp = torch.loadPackageSafe('torchzfp')
 local paths = require('paths')
@@ -33,11 +28,8 @@ local ZFP_ACCURACY = 1e-5
 local DIV_THRESHOLD = 100  -- Relaxed threshold.
 local DEFAULT_BORDER_WIDTH = 1
 
--- Helper function to load in and perform assertions on a run timestep file.
--- This is a little naughty. Dump tfluids in the tfluids namespace so it can
--- be used externally.
 -- @param bWidth: How much of the border to remove.
-function tfluids.loadFile(fn, bWidth)
+function DataBinary:_loadFile(fn, bWidth)
   bWidth = bWidth or DEFAULT_BORDER_WIDTH
   assert(paths.filep(fn), "couldn't find ".. fn)
   local file = torch.DiskFile(fn, 'r')
@@ -87,7 +79,7 @@ function DataBinary:__init(conf, prefix)
   self.dataDir = conf.dataDir  -- Just for reference
   self.dataset = conf.dataset  -- Just for reference
   self.prefix = prefix
-  local baseDir = self:_getBaseDir(conf) .. '/'
+  local baseDir = self:_getBaseDir(conf.dataDir) .. '/'
   local runDirs = torch.ls(baseDir)
   assert(#runDirs > 0, "couldn't find any run directories in " .. baseDir)
 
@@ -101,10 +93,10 @@ function DataBinary:__init(conf, prefix)
   self.minValue = math.huge
   for i = 1, #runDirs do
     torch.progress(i, #runDirs)
-    local runDir = self:_getBaseDir(conf) .. '/' .. runDirs[i] .. '/'
+    local runDir = self:_getBaseDir(conf.dataDir) .. '/' .. runDirs[i] .. '/'
     local files = torch.ls(runDir .. '*[0-9].bin')
     local divFiles = torch.ls(runDir .. '*[0-9]_divergent.bin')
-    
+
     assert(#files == #divFiles,
            "Main file count not equal to divergence file count")
     assert(#files > conf.ignoreFrames, 'Not enough files in sub-dir ' .. runDir)
@@ -121,9 +113,9 @@ function DataBinary:__init(conf, prefix)
     local dataMin = math.huge;
     for f = 1, #runFiles do
       collectgarbage()
-      local time, p, Ux, Uy, Uz, geom, minVal = tfluids.loadFile(runFiles[f])
+      local time, p, Ux, Uy, Uz, geom, minVal = self:_loadFile(runFiles[f])
       local _, pDiv, UxDiv, UyDiv, UzDiv, _, _ =
-          tfluids.loadFile(runFilesDivergence[f])
+          self:_loadFile(runFilesDivergence[f])
 
       dataMin = math.min(minVal, dataMin)
 
@@ -226,16 +218,13 @@ function DataBinary:__init(conf, prefix)
   self.samples = torch.LongTensor(self.samples)
 end
 
-function DataBinary:_getBaseDir(conf)
-  -- Sanity check the dataset name (note: the dataDir might have changed).
-  assert(conf.dataset == self.dataset,
-         'trying to get data from the wrong dataset')
-  return conf.dataDir .. '/' .. conf.dataset .. '/' .. self.prefix .. '/'
+function DataBinary:_getBaseDir(dataDir)
+  return dataDir .. '/' .. self.dataset .. '/' .. self.prefix .. '/'
 end
 
 -- Note: runDir is typically self.runs[irun].dir
-function DataBinary:_getCachePath(conf, runDir, iframe)
-  local dir = self:_getBaseDir(conf) .. '/' .. runDir .. '/'
+function DataBinary:_getCachePath(dataDir, runDir, iframe)
+  local dir = self:_getBaseDir(dataDir) .. '/' .. runDir .. '/'
   local fn = string.format('frame_cache_%06d', iframe)
   return dir .. fn
 end
@@ -271,14 +260,14 @@ function DataBinary:_cacheDataToDisk(data, conf, runDir)
       end
       frameData[key] = v
     end
-    torch.save(self:_getCachePath(conf, runDir, iframe), frameData)
+    torch.save(self:_getCachePath(conf.dataDir, runDir, iframe), frameData)
   end
 end
 
-function DataBinary:_loadDiskCache(conf, irun, iframe)
+function DataBinary:_loadDiskCache(dataDir, irun, iframe)
   assert(irun <= #self.runs and irun >= 1)
   assert(iframe <= self.runs[irun].ntimesteps and iframe >= 1)
-  local fn = self:_getCachePath(conf, self.runs[irun].dir, iframe)
+  local fn = self:_getCachePath(dataDir, self.runs[irun].dir, iframe)
   local data = torch.load(fn)
   for key, value in pairs(data) do
     if torch.type(value) == 'torch.ZFPTensor' then
@@ -289,12 +278,12 @@ function DataBinary:_loadDiskCache(conf, irun, iframe)
 end
 
 -- Abstract away getting data from however we store it.
-function DataBinary:getSample(conf, irun, iframe)
+function DataBinary:getSample(dataDir, irun, iframe)
   assert(irun <= #self.runs and irun >= 1, 'getSample: irun out of bounds!')
   assert(iframe <= self.runs[irun].ntimesteps and iframe >= 1,
     'getSample: iframe out of bounds!')
 
-  local data = self:_loadDiskCache(conf, irun, iframe)
+  local data = self:_loadDiskCache(dataDir, irun, iframe)
 
   local p = data.p
   local pDiv = data.pDiv
@@ -308,13 +297,13 @@ function DataBinary:getSample(conf, irun, iframe)
     Uz = data.Uz
     UzDiv = data.UzDiv
   end
-  
+
   return p, Ux, Uy, Uz, geom, pDiv, UxDiv, UyDiv, UzDiv
 end
 
 function DataBinary:saveSampleToMatlab(conf, filename, irun, iframe)
   local p, Ux, Uy, Uz, geom, pDiv, UxDiv, UyDiv, UzDiv =
-      self:getSample(conf, irun, iframe)
+      self:getSample(conf.dataDir, irun, iframe)
   local data = {p = p, Ux = Ux, Uy = Uy, Uz = Uz, geom = geom,
                 pDiv = pDiv, UxDiv = UxDiv, UyDiv = UyDiv, UzDiv = UzDiv}
   for key, value in pairs(data) do
@@ -352,7 +341,7 @@ function DataBinary:visualizeData(conf, irun, depth)
 
   for i = 1, ntimesteps do
     local p, Ux, Uy, Uz, geom, pDiv, UxDiv, UyDiv, UzDiv =
-        self:getSample(conf, irun, i)
+        self:getSample(conf.dataDir, irun, i)
     data.geom[i]:copy(geom)
     data.p[i]:copy(p)
     data.U[i][1]:copy(Ux)
@@ -418,17 +407,16 @@ function DataBinary:visualizeBatch(conf, mconf, imgList, depth)
   end
   depth = depth or 1
 
-  local batchCPU = self:AllocateBatchMemory(conf.batchSize, conf, mconf)
-  local batchGPU = self:cloneBatchToGPU(batchCPU)
+  local batchCPU = self:AllocateBatchMemory(conf.batchSize)
 
   local perturb = conf.trainPerturb.on
   local degRot, scale, transVPix, transUPix, flipX, flipY, flipZ =
-    self:CreateBatch(batchCPU, torch.IntTensor(imgList), conf, mconf, perturb)
-
-  -- Just for testing purposes, also call a sync on the CPU --> GPU to replicate
-  -- what we do during training (i.e. tests sync).
-  self:syncBatchToGPU(batchCPU, batchGPU)
-
+    self:CreateBatch(batchCPU, torch.IntTensor(imgList), conf.batchSize,
+                     perturb, conf.trainPerturb, mconf.netDownsample,
+                     conf.dataDir)
+  local batchGPU = torch.deepClone(batchCPU, 'torch.CudaTensor')
+  -- Also call a sync just to test that as well.
+  torch.syncBatchToGPU(batchCPU, batchGPU)
 
   print('    Image set:')  -- Don't print if this is used in the train loop.
   for i = 1, #imgList do
@@ -436,7 +424,7 @@ function DataBinary:visualizeBatch(conf, mconf, imgList, depth)
 
     local irun = self.samples[isample][1]
     local if1 = self.samples[isample][2]
-    
+
     print(string.format("    %d - sample %d: irun = %d, if1 = %d", i,
                         imgList[i], irun, if1))
     print(string.format(
@@ -446,7 +434,7 @@ function DataBinary:visualizeBatch(conf, mconf, imgList, depth)
   end
 
   local range = {1, #imgList}
-  for key, value in pairs(batchGPU) do
+  for key, value in pairs(batchCPU) do
     batchGPU[key] = value[{range}]  -- Just pick the samples in the imgList.
   end
 
@@ -469,22 +457,10 @@ end
 
 function DataBinary:AllocateBatchMemory(batchSize, ...)
   collectgarbage()  -- Clean up thread memory.
-
-  -- Unpack variable args.
-  local args = {...}
-  local conf = args[1]
-  local mconf = args[2]
-  assert(conf ~= nil and mconf ~= nil)
-
-  assert(batchSize == conf.batchSize)  -- Sanity check
-
   -- Create the data containers.
   local d = self.zdim
   local h = self.ydim
   local w = self.xdim
-
-  assert(self.twoDim == mconf.twoDim,
-    'Mixing 3D model with 2D data or vice-versa!')
 
   local batchCPU = {}
 
@@ -492,11 +468,11 @@ function DataBinary:AllocateBatchMemory(batchSize, ...)
   if self.twoDim then
     numUChans = 2
   end
-  batchCPU.pDiv = torch.FloatTensor(conf.batchSize, 1, d, h, w):normal()
+  batchCPU.pDiv = torch.FloatTensor(batchSize, 1, d, h, w):normal()
   batchCPU.pTarget = batchCPU.pDiv:clone()
-  batchCPU.UDiv = torch.FloatTensor(conf.batchSize, numUChans, d, h, w):normal()
+  batchCPU.UDiv = torch.FloatTensor(batchSize, numUChans, d, h, w):normal()
   batchCPU.UTarget = batchCPU.UDiv:clone()
-  batchCPU.geom = torch.FloatTensor(conf.batchSize, 1, d, h, w):normal()
+  batchCPU.geom = torch.FloatTensor(batchSize, 1, d, h, w):normal()
 
   return batchCPU
 end
@@ -528,17 +504,28 @@ end
 
 -- CreateBatch fills already preallocated data structures.  To be used in a
 -- training loop where the memory is allocated once and reused.
+-- @param batchCPU - batch CPU table container.
+-- @param sampleSet - 1D tensor of sample indices.
+-- @param ... - 5 arguments:
+--     batchSize - size of batch container (usually conf.batchSize).
+--     perturb - Preturb ON / OFF.
+--     trainPerturb - preturb params (usually conf.trainPretrub).
+--     netDownsample - network downsample factor (usually mconf.netDownsample).
+--     dataDir - path to data directory cache (usually conf.dataDir).
 function DataBinary:CreateBatch(batchCPU, sampleSet, ...)
   -- Unpack variable length args.
   local args = {...}
-  local conf = args[1]
-  local mconf = args[2]
-  local perturb = args[3]
-  assert(conf ~= nil and mconf ~= nil and perturb ~= nil)
 
-  assert(sampleSet:size(1) <= conf.batchSize)  -- sanity check.
+  assert(#args == 5, 'Expected 5 additional args to CreateBatch')
+  local batchSize = args[1]  -- size of batch container, not the sampleSet.
+  local perturb = args[2]  -- Preturb ON / OFF.
+  local trainPerturb = args[3]  -- preturb params.
+  local netDownsample = args[4]  -- network downsample factor.
+  local dataDir = args[5]
 
-  assert(mconf.netDownsample == 1, "pooling not supported")
+  assert(sampleSet:size(1) <= batchSize)  -- sanity check.
+
+  assert(netDownsample == 1, "pooling not supported")
   if perturb == nil then
     perturb = false
   end
@@ -552,16 +539,17 @@ function DataBinary:CreateBatch(batchCPU, sampleSet, ...)
   end
 
   -- Make sure we haven't done anything silly.
-  assert(self.twoDim == mconf.twoDim,
+  local twoDim = batchCPU.UDiv:size(2) == 2
+  assert(self.twoDim == twoDim,
          'Mixing 3D model with 2D data or vice-versa!')
 
-  local degRot = torch.FloatTensor(conf.batchSize)
-  local scale = torch.FloatTensor(conf.batchSize)
-  local transUPix = torch.FloatTensor(conf.batchSize)
-  local transVPix = torch.FloatTensor(conf.batchSize)
-  local flipX = torch.ByteTensor(conf.batchSize)
-  local flipY = torch.ByteTensor(conf.batchSize)
-  local flipZ = torch.ByteTensor(conf.batchSize)
+  local degRot = torch.FloatTensor(batchSize)
+  local scale = torch.FloatTensor(batchSize)
+  local transUPix = torch.FloatTensor(batchSize)
+  local transVPix = torch.FloatTensor(batchSize)
+  local flipX = torch.ByteTensor(batchSize)
+  local flipY = torch.ByteTensor(batchSize)
+  local flipZ = torch.ByteTensor(batchSize)
   local pDiv, geom, UDiv
 
   pDiv = torch.FloatTensor(1, self.zdim, self.ydim, self.xdim)
@@ -569,6 +557,8 @@ function DataBinary:CreateBatch(batchCPU, sampleSet, ...)
   UDiv = torch.FloatTensor(numUChans, self.zdim, self.ydim, self.xdim)
   local pTarget = pDiv:clone()
   local UTarget = UDiv:clone()
+
+  local flipTemp = torch.FloatTensor()
 
   degRot:fill(0)
   scale:fill(1)
@@ -589,17 +579,17 @@ function DataBinary:CreateBatch(batchCPU, sampleSet, ...)
     -- Randomly perturb the data
     if perturb then
       -- Sample perturbation parameters.
-      assert(conf.trainPerturb.scale == 0, 'Scale not yet supported.')
+      assert(trainPerturb.scale == 0, 'Scale not yet supported.')
       scale[i] = 0
-      assert(conf.trainPerturb.transPix == 0, 'Translation not yet supported.')
+      assert(trainPerturb.transPix == 0, 'Translation not yet supported.')
       transVPix[i] = 0
       transUPix[i] = 0
-      assert(conf.trainPerturb.rotation == 0, 'Rotation not yet supported.')
+      assert(trainPerturb.rotation == 0, 'Rotation not yet supported.')
       degRot[i] = 0
-      flipX[i] = torch.bernoulli(conf.trainPerturb.flipProb)
-      flipY[i] = torch.bernoulli(conf.trainPerturb.flipProb)
+      flipX[i] = torch.bernoulli(trainPerturb.flipProb)
+      flipY[i] = torch.bernoulli(trainPerturb.flipProb)
       if not self.twoDim then
-        flipZ[i] = torch.bernoulli(conf.trainPerturb.flipProb)
+        flipZ[i] = torch.bernoulli(trainPerturb.flipProb)
       else
         flipZ[i] = 0
       end
@@ -607,7 +597,7 @@ function DataBinary:CreateBatch(batchCPU, sampleSet, ...)
 
     -- Copy the input channels
     local p1, Ux1, Uy1, Uz1, geom1, p1Div, Ux1Div, Uy1Div, Uz1Div =
-        self:getSample(conf, irun, if1)
+        self:getSample(dataDir, irun, if1)
     pDiv:copy(p1Div)
     geom:copy(geom1)
     UDiv[1]:copy(Ux1Div)
@@ -619,12 +609,9 @@ function DataBinary:CreateBatch(batchCPU, sampleSet, ...)
 
     local function flip(tensor, dim)
       -- Define global temporary buffer so that we don't needlessly malloc.
-      if torch._flipTensor == nil then
-        torch._flipTensor = torch.FloatTensor()
-      end
-      torch._flipTensor:resizeAs(tensor)
-      image.flip(torch._flipTensor, tensor, dim)
-      tensor:copy(torch._flipTensor)
+      flipTemp:resizeAs(tensor)
+      image.flip(flipTemp, tensor, dim)
+      tensor:copy(flipTemp)
     end
 
     local function performFlips(tensor, flipX, flipY, flipZ, UField)
@@ -688,27 +675,7 @@ function DataBinary:CreateBatch(batchCPU, sampleSet, ...)
   return degRot, scale, transVPix, transUPix, flipX, flipY, flipZ
 end
 
--- Deep-copy all batch data from the CPU to the GPU.
-function DataBinary:syncBatchToGPU(batchCPU, batchGPU)
-  assert(type(batchCPU) == 'table' and type(batchGPU) == 'table')
-  for key, value in pairs(batchCPU) do
-    assert(batchGPU[key] ~= nil)
-    if type(value) == 'table' then
-      syncBatchToGPU(batchGPU[key], value)  -- recurse on sub-tables.
-    else
-      assert(torch.isTensor(value))
-      batchGPU[key]:copy(value)
-    end
-  end
-end
-
--- Create a deep-copy of batchCPU on the GPU.
-function DataBinary:cloneBatchToGPU(batchCPU)
-  return  torch.deepClone(batchCPU, 'torch.CudaTensor')
-end
-
 function DataBinary:nsamples()
   -- Return the maximum number of image pairs we can support
   return self.samples:size(1)
 end
-

@@ -24,7 +24,7 @@ local tfluids = require('tfluids')
 local nn = require('nn')
 require('image')
 dofile('../lib/load_package_safe.lua')
-dofile('../lib/data_binary.lua')  -- For loadFile()
+dofile('../lib/data_binary.lua')  -- For torch.DataBinary:_loadFile()
 dofile('calc_velocity_update.lua')
 dofile('../lib/modules/spatial_finite_elements.lua')
 dofile('../lib/modules/volumetric_finite_elements.lua')
@@ -43,10 +43,8 @@ end
 local function testVelocityUpdate()
   -- Load a frame from file (for testing). We'll test both the 2D and 3D cases.
   local dataDirs = {}
-  -- dataDirs[#dataDirs + 1] = '../../data/datasets/output_current'
-  dataDirs[#dataDirs + 1] = '../../data/datasets/output_current_geom'
-  -- dataDirs[#dataDirs + 1] = '../../data/datasets/output_current_3d'
-  dataDirs[#dataDirs + 1] = '../../data/datasets/output_current_3d_geom'
+  dataDirs[#dataDirs + 1] = '../../data/datasets/output_current_model_sphere'
+  dataDirs[#dataDirs + 1] = '../../data/datasets/output_current_3d_model_sphere'
   local setName = 'tr'
   local maxErr = 0
   local precision = 1e-5
@@ -58,6 +56,7 @@ local function testVelocityUpdate()
     -- Test every single scene and every single frame!
     -- Firstly, collect all the frames.
     local scenes = ls(setDir)
+    assert(#scenes > 0)
     local allFiles = {}
     local allDivFiles = {}
     print('  ==> Collecting file names')
@@ -85,8 +84,8 @@ local function testVelocityUpdate()
       torch.progress(i, #allFiles)
       local fn = allFiles[i]
       local fnDiv = allDivFiles[i]
-      local time, p, Ux, Uy, Uz, geom = tfluids.loadFile(fn)
-      local _, pDiv, UxDiv, UyDiv, UzDiv = tfluids.loadFile(fnDiv)
+      local time, p, Ux, Uy, Uz, geom = torch.DataBinary:_loadFile(fn)
+      local _, pDiv, UxDiv, UyDiv, UzDiv = torch.DataBinary:_loadFile(fnDiv)
       local zdim = p:size(1)
       local ydim = p:size(2)
       local xdim = p:size(3)

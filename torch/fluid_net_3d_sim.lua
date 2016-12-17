@@ -117,7 +117,7 @@ for r = 1, #tr.runs do
   torch.progress(r, #tr.runs)
   for i = 1, tr.runs[r].ntimesteps do
     local curUMax = 0
-    local p, Ux, Uy, Uz = tr:getSample(conf, r, i)
+    local p, Ux, Uy, Uz = tr:getSample(conf.dataDir, r, i)
     curUMax = math.max(curUMax, Ux:abs():max())
     curUMax = math.max(curUMax, Uy:abs():max())
     curUMax = math.max(curUMax, Uz:abs():max())

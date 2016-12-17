@@ -25,13 +25,13 @@ function torch.plotWeightHistograms(conf, mconf, model, data, criterion,
   -- Pick a random batch.
   model:clearState()
   collectgarbage()
-  
+
   local imgList = torch.randperm(data:nsamples())[{{1, conf.batchSize}}]
   imgList = imgList:totable()
-  local batchCPU, batchGPU = data:AllocateBatchMemory(conf.batchSize, conf,
-                                                      mconf)
+  local batchCPU, batchGPU = data:AllocateBatchMemory(conf.batchSize)
   local perturb = false
-  data:CreateBatch(batchCPU, torch.IntTensor(imgList), conf, mconf, perturb)
+  data:CreateBatch(batchCPU, torch.IntTensor(imgList), conf.batchSize, perturb,
+                   {}, mconf.netDownsample, conf.dataDir)
 
   -- FPROP AND BPROP a sample:
   local input = torch.getModelInput(batchGPU)

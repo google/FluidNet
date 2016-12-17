@@ -31,6 +31,7 @@ if cudnn ~= nil then
   cudnn.fastest = true  -- Use this instead of 'benchmark' if unstable.
 end
 require 'nngraph'
+require 'tfluids'
 torch.loadPackageSafe('qt')
 torch.loadPackageSafe('qttorch')
 torch.loadPackageSafe('qtwidget')
@@ -40,6 +41,7 @@ torch.loadPackageSafe('torchzlib')
 
 local file = torch.loadPackageSafe('learning.lua.file')
 if file ~= nil then
+  print('WARNING: redirecting file functions (open, save, filep).')
   io.open = file.open
   torch.load = function(filename)
     assert(file.Exists(filename))

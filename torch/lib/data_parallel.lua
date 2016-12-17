@@ -53,35 +53,59 @@ local DataParallel, parent = torch.class('torch.DataParallel')
 -- threads start WITHOUT any definitions or classes defined. Therefore, you
 -- will need to redefine anything used by the thread (i.e. redefine the
 -- dataProvider class).
+-- @param singleThreaded - (OPTIONAL) Used for debugging. Serializes all
+-- createBatch calls into the main thread.
 function DataParallel:__init(numThreads, dataProvider, sampleSet, batchSize,
-                             initThreadFunc)
-  assert(numThreads > 0)
+                             initThreadFunc, singleThreaded)
+  if singleThreaded == nil then
+    singleThreaded = false
+  end
+  if not singleThreaded then
+    assert(numThreads > 0)
+  end
   -- Start the threads.
   assert(torch.isTensor(sampleSet) and sampleSet:dim() == 1)
 
   self._sampleSet = sampleSet
   self._batchSize = batchSize
   self._nextSampleIndex = 1
-  self._curBatch = {}
- 
+  self._singleThreaded = singleThreaded
+  self._dataProvider = dataProvider
+
   -- Create the thread queue.
-  self._pool = threads.Threads(
-      numThreads,
-      -- Note: According to the docs, you must init all function definitions
-      -- first before storing any types in the thread local storage.
-      function(tid)
-        initThreadFunc()
-      end,
-      function(tid)
-        threadDP = dataProvider  -- Thread local variable.
-        threadID = tid
-        threadBS = batchSize
-      end
-  )
+  if not self._singleThreaded then
+    self._curBatch = {}
+    self._pool = threads.Threads(
+        numThreads,
+        -- Note: According to the docs, you must init all function definitions
+        -- first before storing any types in the thread local storage.
+        function(tid)
+          initThreadFunc()
+        end,
+        function(tid)
+          threadDP = dataProvider  -- Thread local variable.
+          threadID = tid
+          threadBS = batchSize
+        end
+    )
+  end
+end
+
+function DataParallel:_getNextBatchSet()
+  local batchSize = self._batchSize  -- Can't upvalue self.xxx values.
+  local batchEndIndex = math.min(self._nextSampleIndex + batchSize - 1,
+                                 self._sampleSet:size(1))
+  local batchSet = self._sampleSet[{{self._nextSampleIndex, batchEndIndex}}]
+  self._nextSampleIndex = self._nextSampleIndex + self._batchSize
+  return batchSet
 end
 
 -- fillQueue will fill up the queue as much as possible.
 function DataParallel:_fillQueue(...)
+  if self._singleThreaded then
+    return
+  end
+
   local args = {...}
 
   -- Full up the queue as much as we can.
@@ -89,20 +113,17 @@ function DataParallel:_fillQueue(...)
       self._pool:acceptsjob() do
 
     -- Add a batch of samples.
-    local batchSize = self._batchSize  -- Can't upvalue self.xxx values.
-    local batchEndIndex = math.min(self._nextSampleIndex + batchSize - 1,
-                                   self._sampleSet:size(1))
-    local batchSet = self._sampleSet[{{self._nextSampleIndex, batchEndIndex}}]
+    local batchSet = self:_getNextBatchSet()
 
     -- Add a job for the current batchSet.
     self._pool:addjob(
       function()
         -- Allocate the batch memory.
         local batchCPU = threadDP:AllocateBatchMemory(threadBS, unpack(args))
-        
+
         -- Create the batch.
         threadDP:CreateBatch(batchCPU, batchSet, unpack(args))
-        
+
         -- Return the batch data.
         return {data = batchCPU, batchSet = batchSet}
       end,
@@ -110,8 +131,6 @@ function DataParallel:_fillQueue(...)
         self._curBatch = jobres
       end
     )
-
-    self._nextSampleIndex = self._nextSampleIndex + self._batchSize
   end
 end
 
@@ -120,6 +139,13 @@ function DataParallel:empty()
   if self._nextSampleIndex <= self._sampleSet:size(1) then
     return false  -- Still batches to be placed on the queue.
   end
+
+  -- Single threaded mode is not asynchronous. Nothing should be pending, if
+  -- we're beyond the sample set end then we're done.
+  if self._singleThreaded then
+    return true
+  end
+
   -- Otherwise, see if the queue is empty and has been fully depleted.
   return not self._pool:hasjob()
 end
@@ -134,9 +160,17 @@ end
 function DataParallel:getBatch(...)
   local args = {...}
 
+  if self._singleThreaded then
+    local batchSet = self:_getNextBatchSet()
+    local batchCPU =
+        self._dataProvider:AllocateBatchMemory(self._batchSize, unpack(args))
+    self._dataProvider:CreateBatch(batchCPU, batchSet, unpack(args))
+    return {data = batchCPU, batchSet = batchSet}
+  end
+
   -- Add samples to the queue.
   self:_fillQueue(unpack(args))
- 
+
   -- If the queue is still empty, then return nil.
   if self:empty() then
     return nil

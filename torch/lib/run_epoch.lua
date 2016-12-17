@@ -12,6 +12,7 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
+local cunn = require('cunn')
 local sys = require('sys')
 local tfluids = require('tfluids')
 local mattorch = torch.loadPackageSafe('mattorch')
@@ -52,7 +53,7 @@ function torch.runEpoch(input)
 
   local dataInds
   if training then
-    -- When training, shuffle the indices. 
+    -- When training, shuffle the indices.
     dataInds = torch.randperm(data:nsamples()):int()
   else
     -- When testing, go through the dataset in order.
@@ -67,20 +68,23 @@ function torch.runEpoch(input)
 
   -- Containers for the current batch, the CPU storage gets filled and then
   -- transferred in one shot to the GPU.
-  local batchGPU = data:cloneBatchToGPU(
-      data:AllocateBatchMemory(conf.batchSize, conf, mconf))
+  local batchGPU
+  do
+    local batchCPU = data:AllocateBatchMemory(conf.batchSize)
+    batchGPU = torch.deepClone(batchCPU, 'torch.CudaTensor')
+  end
 
   -- Create a parallel data container to synchronously create batches (very
   -- important for the 2D model since diskIO becomes the bottleneck).
   local function initThreadFunc()
     -- Recall: All threads must be initialized with all classes and packages.
-    require('torch')
-    require('tfluids')
     dofile('lib/load_package_safe.lua')
     dofile('lib/data_binary.lua')
   end
+  local singleThreaded = false  -- Set to true for easier debugging.
   local parallel = torch.DataParallel(conf.numDataThreads, data, dataInds,
-                                      conf.batchSize, initThreadFunc)
+                                      conf.batchSize, initThreadFunc,
+                                      singleThreaded)
 
   local batchGradNorm = {}
 
@@ -92,7 +96,7 @@ function torch.runEpoch(input)
       mattorch.save(fn, {batchGradNorm = batchGradNormTensor,
                          epoch = torch.DoubleTensor({mconf.epoch})})
       print("  - batch gradient norms saved to " .. fn)
-    end 
+    end
   end
 
   if training then
@@ -133,7 +137,9 @@ function torch.runEpoch(input)
     -- Get a processed batch. NOTE: they may be out of order since we
     -- process them asynchronously. We only perturb during training.
     local perturbData = conf.trainPerturb.on and training
-    local batch = parallel:getBatch(conf, mconf, perturbData)
+    local batch = parallel:getBatch(conf.batchSize, perturbData,
+                                    conf.trainPerturb, mconf.netDownsample,
+                                    conf.dataDir)
 
     -- Check we don't double count any samples. This is technically tested
     -- in test_data_parallel.lua, but do it again here just in case.
@@ -144,7 +150,7 @@ function torch.runEpoch(input)
     end
 
     -- Sync the batch to the GPU.
-    data:syncBatchToGPU(batch.data, batchGPU) 
+    torch.syncBatchToGPU(batch.data, batchGPU)
 
     -- The first batch is not representative of processing time, don't include
     -- it (this is because lots of mallocs happen on the first batch).
@@ -174,7 +180,7 @@ function torch.runEpoch(input)
       local err = crit:forward(output, target)
       lastBatchErr = err
       batchErr[#batchErr + 1] = {
-          inds = imgList,
+          inds = batchSet,
           err = err,
       }
 
@@ -195,7 +201,7 @@ function torch.runEpoch(input)
       end
 
       if training then
-        -- estimate df/dW.  
+        -- estimate df/dW.
         local df_do = crit:backward(output, target)
         model:backward(input, df_do)
       end
@@ -228,7 +234,7 @@ function torch.runEpoch(input)
           tfluids.simulate(conf, mconf, batchGPU, model, outputDiv)
         end
         torch.setDropoutTrain(model, training)
-       
+
         -- The simulate output is left on the GPU.
         local output = model:forward(input)
 
@@ -285,7 +291,7 @@ function torch.runEpoch(input)
 
     nbatches = nbatches + 1
   until parallel:empty()
-  
+
   -- Make sure we processed every single sample we meant to.
   assert(nbatches == nbatchesTotal)
   for i = 1, dataInds:size(1) do

@@ -13,6 +13,7 @@
 -- limitations under the License.
 
 require 'nn'
+local sys = require('sys')
 
 torch.setdefaulttensortype('torch.DoubleTensor')
 torch.setnumthreads(16)
@@ -33,30 +34,7 @@ local function initThreadFunc()
   dofile('data_dummy.lua')
 end
 
-function tests.ParallelCreateBatch()
-  local numThreads = 16
-  local batchSize = 7
-  local numBatches = 1000
-  local workTime = 0.01  -- Seconds.
-  local numSamples = batchSize * (numBatches - 1) + 1  -- Create 1 partial batch
-
-  local dataProvider = torch.DataDummy(numSamples, workTime)
-  local sampleSet = torch.randperm(numSamples)  -- All samples in the epoch.
-  local parallel = torch.DataParallel(numThreads, dataProvider, sampleSet, 
-                                      batchSize, initThreadFunc)
-
-  mytester:assert(not parallel:empty())
-
-  local batches = {}  -- We'll save all the batches.
-  repeat
-    local batch = parallel:getBatch()
-    mytester:assert(batch ~= nil)
-    batches[#batches + 1] = batch
-    mytester:assertle(#batches, numBatches)  -- Make sure we don't get too many
-  until parallel:empty()
-  
-  mytester:assert(parallel:empty())  -- redundant, but do it anyway.
- 
+local function checkBatchData(batches, dataProvider, batchSize, numSamples)
   -- Make sure each batch is properly formatted.
   for _, batch in pairs(batches) do
     -- Each batch sample should have a batchSet (the set of indices).
@@ -66,7 +44,7 @@ function tests.ParallelCreateBatch()
     -- Each batch should have some data.
     mytester:assert(batch.data ~= nil)
     mytester:assert(torch.isTensor(batch.data.sampleData))
-    mytester:assert(batch.data.sampleData:size(1) == batchSize) 
+    mytester:assert(batch.data.sampleData:size(1) == batchSize)
   end
 
   -- Make sure each sample index was covered exactly once.
@@ -90,6 +68,93 @@ function tests.ParallelCreateBatch()
       mytester:asserteq(dataProvider.sampleData[curSampleInd], curSampleValue)
     end
   end
+end
+
+function tests.ParallelCreateBatch()
+  local numThreads = 16
+  local batchSize = 7
+  local numBatches = 100
+  local workTime = 0.01  -- Seconds.
+  local numSamples = batchSize * (numBatches - 1) + 1  -- Create 1 partial batch
+
+  local dataProvider = torch.DataDummy(numSamples, workTime)
+  local sampleSet = torch.randperm(numSamples)  -- All samples in the epoch.
+  local parallel = torch.DataParallel(numThreads, dataProvider, sampleSet,
+                                      batchSize, initThreadFunc)
+
+  mytester:assert(not parallel:empty())
+
+  local batches = {}  -- We'll save all the batches.
+  repeat
+    local batch = parallel:getBatch()
+    mytester:assert(batch ~= nil)
+    batches[#batches + 1] = batch
+    mytester:assertle(#batches, numBatches)  -- Make sure we don't get too many
+  until parallel:empty()
+
+  mytester:assert(parallel:empty())  -- redundant, but do it anyway.
+
+  checkBatchData(batches, dataProvider, batchSize, numSamples)
+end
+
+function tests.SingleThreadedCreateBatch()
+  local numThreads = nil
+  local batchSize = 7
+  local numBatches = 100
+  local workTime = 0.01  -- Seconds.
+  local numSamples = batchSize * (numBatches - 1) + 1  -- Create 1 partial batch
+  local singleThreaded = true
+
+  local dataProvider = torch.DataDummy(numSamples, workTime)
+  local sampleSet = torch.randperm(numSamples)  -- All samples in the epoch.
+  local parallel = torch.DataParallel(numThreads, dataProvider, sampleSet,
+                                      batchSize, initThreadFunc, singleThreaded)
+
+  mytester:assert(not parallel:empty())
+
+  local batches = {}  -- We'll save all the batches.
+  repeat
+    local batch = parallel:getBatch()
+    mytester:assert(batch ~= nil)
+    batches[#batches + 1] = batch
+    mytester:assertle(#batches, numBatches)  -- Make sure we don't get too many
+  until parallel:empty()
+
+  mytester:assert(parallel:empty())  -- redundant, but do it anyway.
+
+  checkBatchData(batches, dataProvider, batchSize, numSamples)
+end
+
+function tests.profileDataParallel()
+  local batchSize = 7
+  local numBatches = 50
+  local workTime = 0.1  -- Seconds.
+  local numSamples = batchSize * (numBatches - 1) + 1  -- Create 1 partial batch
+
+  local dataProvider = torch.DataDummy(numSamples, workTime)
+  local sampleSet = torch.randperm(numSamples)  -- All samples in the epoch.
+
+  local timing = {}
+  local numPowers2 = 5
+  for i = 0, numPowers2 - 1 do
+    local numThreads = math.pow(2, i)
+    local parallel = torch.DataParallel(numThreads, dataProvider, sampleSet,
+                                        batchSize, initThreadFunc)
+    sys.tic()
+    -- Exhaust the queue
+    local numProcessedBatches = 0
+    repeat
+      parallel:getBatch()
+      mytester:assertle(numProcessedBatches, numBatches)
+      numProcessedBatches = numProcessedBatches + 1
+    until parallel:empty()
+    local time = sys.toc()
+    timing[numThreads .. ' threads'] = time
+  end
+
+  print('Timing numers (batchSize = ' .. batchSize .. ', numBatches = ' ..
+        numBatches .. ', workTime = ' .. workTime .. '):')
+  print(timing)
 end
 
 -- Now run the test above
