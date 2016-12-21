@@ -21,6 +21,17 @@ The limitations of the current system are outlined at the end of this doc. Pleas
 
 Note: This is not an official Google product.
 
+UPDATES / NEWS:
+---------------
+
+**Dec 21 2016** 
+
+- Refactor of data processing code.
+- Batch creation is now asynchronous and parallel (to hide file IO latency). Results in slight speed up in training for most systems, and significant speedup for disk IO limited systems (i.e. when files are on a DFS).
+- Data cache paths are now relative, so that cache data can be moved around.
+- Implemented advection in CUDA; entire simulation.lua loop is now on the GPU. Significant speedup for 3D models (both training and eval) and slight speedup for 2D models.
+- Numerous bug fixes and cleanup.
+
 #0. Clone this repo:
 --------------------
 
