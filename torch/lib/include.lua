@@ -39,33 +39,7 @@ torch.loadPackageSafe('qtuiloader')
 torch.loadPackageSafe('mattorch')
 torch.loadPackageSafe('torchzlib')
 
-local file = torch.loadPackageSafe('learning.lua.file')
-if file ~= nil then
-  print('WARNING: redirecting file functions (open, save, filep).')
-  io.open = file.open
-  torch.load = function(filename)
-    assert(file.Exists(filename))
-    local object = file.LoadObject(filename)
-    return object
-  end
-
-  torch.save = function(filename, data)
-    file.SaveObject(filename, data)
-  end
-
-  paths.filep = function(filename)
-    return file.Exists(filename)
-  end
-end
-
--- Define an agnostic mkdir function.
-torch.mkdir = function(dirname)
-  if file ~= nil then
-    assert(file.MakeDir(dirname))
-  else
-    os.execute('mkdir -p "' .. dirname .. '"')
-  end
-end
+dofile('lib/fix_file_references.lua')
 
 -- makeGlobal will add the local variable to the global namespace without
 -- causing the strict library to throw an error or print a warning. It should
@@ -107,6 +81,7 @@ end
 if optim.rmsprop == nil then
   dofile('lib/rmsprop.lua')
 end
+dofile('lib/queue.lua')
 dofile('lib/data_parallel.lua')
 
 torch.setdefaulttensortype('torch.FloatTensor')

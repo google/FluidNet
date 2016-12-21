@@ -18,6 +18,7 @@ local sys = require('sys')
 torch.setdefaulttensortype('torch.DoubleTensor')
 torch.setnumthreads(16)
 
+dofile('queue.lua')
 dofile('data_parallel.lua')
 dofile('data_dummy.lua')
 

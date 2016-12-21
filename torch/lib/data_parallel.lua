@@ -14,7 +14,12 @@
 
 -- For public torch distros, the threads package is required.
 -- >> luarocks install threads
-local threads = require('threads')
+
+local res, threads = pcall(require, 'third_party.lua.threads')
+if res == false then
+  print('INFO: third_party.lua.threads library not found, using threads')
+  threads = require('threads')
+end
 
 -- This is a utility class that encapsulates parallelizing createBatch calls on
 -- a data handler object. i.e. it is useful to hide the processing latency of
@@ -71,6 +76,7 @@ function DataParallel:__init(numThreads, dataProvider, sampleSet, batchSize,
   self._nextSampleIndex = 1
   self._singleThreaded = singleThreaded
   self._dataProvider = dataProvider
+  self._batchSize = batchSize
 
   -- Create the thread queue.
   if not self._singleThreaded then
@@ -116,17 +122,18 @@ function DataParallel:_fillQueue(...)
     local batchSet = self:_getNextBatchSet()
 
     -- Add a job for the current batchSet.
+    local function threadFunc()
+      -- Allocate the batch memory.
+      local batchCPU = threadDP:AllocateBatchMemory(threadBS, unpack(args))
+
+      -- Create the batch.
+      threadDP:CreateBatch(batchCPU, batchSet, unpack(args))
+
+      -- Return the batch data.
+      return {data = batchCPU, batchSet = batchSet}
+    end
     self._pool:addjob(
-      function()
-        -- Allocate the batch memory.
-        local batchCPU = threadDP:AllocateBatchMemory(threadBS, unpack(args))
-
-        -- Create the batch.
-        threadDP:CreateBatch(batchCPU, batchSet, unpack(args))
-
-        -- Return the batch data.
-        return {data = batchCPU, batchSet = batchSet}
-      end,
+      threadFunc,
       function(jobres)
         self._curBatch = jobres
       end

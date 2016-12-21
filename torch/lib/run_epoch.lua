@@ -78,6 +78,7 @@ function torch.runEpoch(input)
   -- important for the 2D model since diskIO becomes the bottleneck).
   local function initThreadFunc()
     -- Recall: All threads must be initialized with all classes and packages.
+    dofile('lib/fix_file_references.lua')
     dofile('lib/load_package_safe.lua')
     dofile('lib/data_binary.lua')
   end

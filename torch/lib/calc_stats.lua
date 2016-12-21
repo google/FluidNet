@@ -47,9 +47,10 @@ function torch.calcStats(input)
       table.insert(imgList, dataInds[i])
     end
 
+    -- TODO(tompson): Parallelize CreateBatch calls (as in run_epoch.lua).
     local perturbData = false
     data:CreateBatch(batchCPU, torch.IntTensor(imgList), conf.batchSize,
-                     perturb, {}, mconf.netDownsample, conf.dataDir)
+                     perturbData, {}, mconf.netDownsample, conf.dataDir)
     local p, U, geom, density = tfluids.getPUGeomDensityReference(batchGPU)
     -- Start with the DIVERGENCE FREE frame (not advected frame).
     U:copy(batchGPU.UTarget)
