@@ -15,7 +15,8 @@
 -- This module simply calls the tfluids.calcVelocityUpdate on forward and
 -- tfluids.calcVelocityUpdateBackward on backwards.
 --
--- The module takes in a table of {p, geom} and outputs deltaU of size
+-- The module takes in a table of {p, geom}, each of size
+-- (batch, 1, depth, height, width) and outputs deltaU of size
 -- (batch, 2/3, depth, height, width).
 
 local tfluids = require('tfluids')
@@ -38,7 +39,14 @@ function VelocityUpdate:updateOutput(input)
   local p = input[1]
   local geom = input[2]
 
-  assert(p:dim() == 4)  -- We include a batch dimension.
+  assert(p:dim() == 5 or p:dim() == 4)  -- OLD style: 4D, NEW style: 5D.
+  assert(geom:isSameSizeAs(p))
+
+  if p:dim() == 5 then
+    p = p[{{}, 1}]  -- Remove the singleton dimension
+    geom = geom[{{}, 1}]  -- Remove the singleton dimension.
+  end
+
   local twoDim = p:size(2) == 1
   if twoDim then
     self.output:resize(p:size(1), 2, p:size(2), p:size(3), p:size(4))
@@ -55,12 +63,20 @@ function VelocityUpdate:updateGradInput(input, gradOutput)
   assert(self.output:isSameSizeAs(gradOutput))
   local p = input[1]
   local geom = input[2]
+
   self.gradInput[1]:resizeAs(p)
   self.gradInput[2]:resizeAs(geom):fill(0)  -- Fill with 0.
 
   local gradP = self.gradInput[1]
 
-  tfluids.calcVelocityUpdateBackward(gradP, p, geom, gradOutput, self.matchManta)
+  if p:dim() == 5 then
+    p = p[{{}, 1}]  -- Remove the singleton dimension
+    geom = geom[{{}, 1}]  -- Remove the singleton dimension.
+    gradP = gradP[{{}, 1}]  -- Remove the singleton dimension.
+  end
+
+  tfluids.calcVelocityUpdateBackward(gradP, p, geom, gradOutput,
+                                     self.matchManta)
   return self.gradInput
 end
 

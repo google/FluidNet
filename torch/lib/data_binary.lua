@@ -468,11 +468,11 @@ function DataBinary:AllocateBatchMemory(batchSize, ...)
   if self.twoDim then
     numUChans = 2
   end
-  batchCPU.pDiv = torch.FloatTensor(batchSize, 1, d, h, w):normal()
+  batchCPU.pDiv = torch.FloatTensor(batchSize, 1, d, h, w):fill(0)
   batchCPU.pTarget = batchCPU.pDiv:clone()
-  batchCPU.UDiv = torch.FloatTensor(batchSize, numUChans, d, h, w):normal()
+  batchCPU.UDiv = torch.FloatTensor(batchSize, numUChans, d, h, w):fill(0)
   batchCPU.UTarget = batchCPU.UDiv:clone()
-  batchCPU.geom = torch.FloatTensor(batchSize, 1, d, h, w):normal()
+  batchCPU.geom = torch.FloatTensor(batchSize, 1, d, h, w):fill(0)
 
   return batchCPU
 end

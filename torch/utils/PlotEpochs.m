@@ -12,7 +12,8 @@
 % See the License for the specific language governing permissions and
 % limitations under the License.
 
-function [] = PlotEpochs()
+% @param path - optional path for model data.
+function [] = PlotEpochs(path)
 % A simple utility to plot the per-epoch performance of a bunch of
 % models (so you can compare learning rates, hyperparams, etc). This is
 % very hacky.
@@ -21,7 +22,9 @@ global prev_models;
 clc;
 
 % Less permissive selection:
-path = '../../data/models';
+if nargin < 1
+  path = '../../data/models';
+end
 
 files = dir([path, '/*_log.txt']);
 files = {files.name};
@@ -127,8 +130,14 @@ function [] = NicePlot(data, indices, models, xlabel_str, ylabel_str, ...
   logx, logy)
 assert(length(models) == length(data));
 assert(length(indices) > 0);
-
+   
 legend_str = {};
+legend_handles = [];
+
+smoothing_window = 10;
+raw_thickness = 1.5;
+raw_alpha = 0.1;
+smooth_thickness = 2;
 
 figure;
 set(gcf, 'Position', [100 100 600 800]);
@@ -147,30 +156,59 @@ for i = 1:length(models)
   header = cur_data.Properties.VariableNames;
   line_spec = line_types{mod(i - 1, length(line_types)) + 1};
   
-  % Plot each of the columns specified by indices.
+  % Plot each of the columns specified by indices. Plot both the raw and
+  % smoothed versions.
   for j = 1:length(indices)
     y = cur_data{:, indices(j)};
     x = 1:length(y);
+    cur_win = max(min(smoothing_window, ceil(length(y - 1) / 3)), 2);
     if logy && ~logx
-      semilogy(x, y, line_spec, 'LineWidth', 2, ...
-        'Color', GetColor((i - 1) * length(indices) + j)); hold on;
+      lraw = semilogy(x, y, line_spec, 'LineWidth', raw_thickness, ...
+        'Color', GetColor((i - 1) * length(indices) + j));
+      hold on;
+      [xsmooth, ysmooth] = smooth(x, log(y), cur_win);
+      ysmooth = exp(ysmooth);
+      lsmooth = semilogy(xsmooth, ysmooth, line_spec, 'LineWidth', ...
+        smooth_thickness, 'Color', ...
+        GetColor((i - 1) * length(indices) + j));
     elseif ~logy && logx
-      semilogx(x, y, line_spec, 'LineWidth', 2, ...
-        'Color', GetColor((i - 1) * length(indices) + j)); hold on;
+      lraw = semilogx(x, y, line_spec, 'LineWidth', raw_thickness, ...
+        'Color', GetColor((i - 1) * length(indices) + j));
+      hold on;
+      [xsmooth, ysmooth] = smooth(log(x), y, cur_win);
+      xsmooth = exp(xsmooth);
+      lsmooth = semilogx(xsmooth, ysmooth, line_spec, 'LineWidth', ...
+        smooth_thickness, 'Color', ...
+        GetColor((i - 1) * length(indices) + j));
     elseif logy && logx
-      loglog(x, y, line_spec, 'LineWidth', 2, ...
-        'Color', GetColor((i - 1) * length(indices) + j)); hold on;      
-      
+      lraw = loglog(x, y, line_spec, 'LineWidth', raw_thickness, ...
+        'Color', GetColor((i - 1) * length(indices) + j));     
+      hold on;
+      [xsmooth, ysmooth] = smooth(log(x), log(y), cur_win);
+      xsmooth = exp(xsmooth);
+      ysmooth = exp(ysmooth);
+      lsmooth = loglog(xsmooth, ysmooth, line_spec, 'LineWidth', ...
+        smooth_thickness, 'Color', ...
+        GetColor((i - 1) * length(indices) + j));
     else
-      plot(x, y, line_spec, 'LineWidth', 2, ...
-        'Color', GetColor((i - 1) * length(indices) + j)); hold on;          
+      lraw = plot(x, y, line_spec, 'LineWidth', raw_thickness, ...
+        'Color', GetColor((i - 1) * length(indices) + j)); hold on;     
+      hold on;
+      [xsmooth, ysmooth] = smooth(x, y, cur_win);
+      lsmooth = plot(xsmooth, ysmooth, line_spec, 'LineWidth', ...
+        smooth_thickness, 'Color', ...
+        GetColor((i - 1) * length(indices) + j));
     end
+    
+    lraw.Color = [lraw.Color(1), lraw.Color(2), lraw.Color(3), raw_alpha];
+    
     xstart = min(xstart, x(1));
     xend = max(xend, x(end));
     ystart = min(ystart, min(y));
     yend = max(yend, y(1));
     legend_str{length(legend_str) + 1} = ...
       [header{indices(j)}, ': ', model_str];
+    legend_handles(length(legend_handles) + 1) = lsmooth;
     if (best_model_val(j) > min(y))
       best_model_val(j) = min(y);
       best_model(j) = i;
@@ -184,8 +222,49 @@ for j = 1:length(indices)
     ')']);
 end
 grid on;
-legend(legend_str, 'Location', 'NorthEast', 'FontSize', ...
-  7, 'Interpreter', 'none');    
+legend(legend_handles, legend_str, 'Location', 'NorthEast', 'FontSize', ...
+  6, 'Interpreter', 'none');    
 xlabel(xlabel_str, 'FontSize', 14);
 ylabel(ylabel_str, 'FontSize', 14);
+end
+
+function [xsmooth, ysmooth] = smooth(x, y, win)
+% We will use filtfilt to filter the data because I don't have the correct
+% toolbox for the 'smooth' Matlab function.
+% recall: filtfilt does forward and backward passes to prevent FIR phase
+% delay
+
+% Firstly, resample (x, y) to even intervals (this is our first hack).
+assert(all(diff(x) > 0));  % X must be monotonicly increasing.
+[ysmooth, xsmooth] = resample(y, x);
+
+% filtfilt, has a property that it forces the final response to
+% exactly intersect the end points (rather than their average), which is
+% undesirable. We therefore add a fictitious data point on each end that is
+% the interpolation of a locally fit line, i.e. we continue the trend of
+% the last win values and use this as the end point for filtering.
+
+% The Forier transform of a M length moving average is:
+% H[f] = sin(pi * f * M) / M * sin(pi * f)
+% --> The 3db point is pretty ugly and figuring out it's phase response
+% at this point is not all that meaningful anyway (it's far from linear
+% phase). Just use the last n points and call it a day.
+nfit = win;
+
+pstart = polyfit(xsmooth(1:nfit), ysmooth(1:nfit)', 1);
+xstart = xsmooth(1) - abs(xsmooth(2) - xsmooth(1));
+ystart = pstart(1) * xstart + pstart(2);
+
+pend = polyfit(xsmooth(end - nfit + 1:end), ...
+  ysmooth(end - nfit + 1:end)', 1);
+xend = xsmooth(end) + abs(xsmooth(end) - xsmooth(end - 1));
+yend = pend(1) * xend + pend(2);
+
+ysmooth = [ystart; ysmooth; yend];
+
+ysmooth = filtfilt(ones(win, 1) / (win), 1, ...
+  ysmooth);
+
+% Now remove the fictitious end points.
+ysmooth = ysmooth(2:end - 1);
 end

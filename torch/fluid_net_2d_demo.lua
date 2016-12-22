@@ -12,7 +12,7 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- This is a real-time OpenGL demo for 2D fluid models.
+-- This is a real-time OpenGL demo for fluid models.
 
 local sys = require('sys')
 local gl = require('libLuaGL')
@@ -95,10 +95,12 @@ local numColors = #colors
 function tfluids.loadData()
   local imgList = {torch.random(1, tr:nsamples())}
   print('Using image: ' .. imgList[1])
-  batchCPU, batchGPU = tr:AllocateBatchMemory(conf.batchSize)
+  batchCPU = tr:AllocateBatchMemory(conf.batchSize)
+  batchGPU = torch.deepClone(batchCPU, 'torch.CudaTensor')
   local perturb = false
   tr:CreateBatch(batchCPU, torch.IntTensor(imgList), conf.batchSize, perturb,
                  {}, mconf.netDownsample, conf.dataDir)
+  torch.syncBatchToGPU(batchCPU, batchGPU)
   assert(tr.twoDim, 'Density needs updating to 3D')
   -- Pick a new density each time.
   densityType = math.fmod(densityType + 1, 5)
