@@ -827,25 +827,58 @@ function torch.drawLabels(img, uv_labels, w, h, start_color, sigma)
   end
 end
 
+function torch.TensorToString(val)
+  assert(torch.isTensor(val))
+  str = '[' .. torch.type(val) .. ' of size '
+  for i = 1, val:dim() do
+    str = str .. val:size(i)
+    if i < val:dim() then
+      str = str .. 'x'
+    end
+  end
+  str = str .. ']'
+  return str
+end
+
 function torch.SerializeTable(val, name, skipnewlines, skipname, depth)
   skipnewlines = skipnewlines or false
   skipname = skipname or false
   depth = depth or 0
 
-  local tmp = string.rep(" ", depth)
+  local tmp
+  if not skipnewlines then
+    tmp = string.rep(" ", depth)
+  else
+    tmp = ""
+  end
 
   if name and (not skipname) then tmp = tmp .. name .. " = " end
 
   if type(val) == "table" then
       tmp = tmp .. "{" .. (not skipnewlines and "\n" or "")
 
-      for k, v in pairs(val) do
-          tmp =
-              tmp .. torch.SerializeTable(v, k, skipnewlines, skipname,
-                                          depth + 1) ..
-              "," .. (not skipnewlines and "\n" or "")
+      -- We need to know if we've come across the last key. In a hash set we
+      -- have no way of doing this without first flattening the key set to a
+      -- vector (table with integer keys).
+      local keys = {}
+      for k, _ in pairs(val) do
+        keys[#keys + 1] = k
       end
 
+      for ikey = 1, #keys do
+          k = keys[ikey]
+          v = val[k]
+          tmp = (tmp ..
+                 torch.SerializeTable(v, k, skipnewlines, skipname, depth + 1))
+          if ikey < #keys then
+            tmp = tmp .. ','
+          end
+          if not skipnewlines then
+            tmp = tmp .. "\n"
+          elseif ikey < #keys then
+            tmp = tmp .. " "
+          end
+      end
       tmp = tmp .. string.rep(" ", depth) .. "}"
   elseif type(val) == "number" then
       tmp = tmp .. tostring(val)
@@ -853,6 +886,8 @@ function torch.SerializeTable(val, name, skipnewlines, skipname, depth)
       tmp = tmp .. string.format("%q", val)
   elseif type(val) == "boolean" then
       tmp = tmp .. (val and "true" or "false")
+  elseif torch.isTensor(val) then
+      tmp = tmp .. torch.type(val)
   else
       tmp = tmp .. "\"[inserializeable datatype:" .. type(val) .. "]\""
   end
@@ -1299,4 +1334,62 @@ function strideTensor(tensor, dim, stride)
   end
   tensor = tensor:view(unpack(sz))
   return tensor:select(dim + 1, 1):contiguous()
+end
+
+function torch.IsInteger(number)
+  assert(torch.type(number) == 'number')
+  return number == math.floor(number)
+end
+
+function torch.HumanReadableNumber(number)
+  assert(torch.type(number) == 'number')
+  local printFormatStr
+  local function formatString(number)
+    if torch.IsInteger(number) then
+      return '%d'
+    else
+      return '%.2f'
+    end
+  end
+
+  local postFix
+  if number >= 1e15 then
+    number = number * 1e-15
+    postFix = 'P'
+  elseif number >= 1e12 then
+    number = number * 1e-12
+    postFix = 'T'
+  elseif number >= 1e9 then
+    number = number * 1e-9
+    postFix = 'G'
+  elseif number >= 1e6 then
+    number = number * 1e-6
+    postFix = 'M' 
+  elseif number >= 1e3 then
+    number = number * 1e-3
+    postFix = 'k'
+  elseif number >= 0 then
+    postFix = ''
+  elseif number >= 1e-3 then
+    number = number * 1e3
+    postFix = 'm'
+  elseif number >= 1e-6 then
+    number = number * 1e6
+    postFix = 'u'
+  elseif number >= 1e-9 then
+    number = number * 1e9
+    postFix = 'n'
+  elseif number >= 1e-12 then
+    number = number * 1e12
+    postFix = 'p'
+  else
+    number = number * 1e15
+    postFix = 'f'
+  end
+
+  if torch.IsInteger(number) then
+    return string.format('%d' .. postFix, number)
+  else
+    return string.format('%.2f' .. postFix, number)
+  end
 end

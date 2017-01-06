@@ -24,6 +24,13 @@ Note: This is not an official Google product.
 UPDATES / NEWS:
 ---------------
 
+**Jan 6 2017**
+- Lots of updates to model and training code.
+- Added model of Yang et al. "Data-driven projection method in fluid simulation" as a baseline comparison.
+- Changed model defaults (no more pooling, smaller network no more p loss term).
+- Improved programmability of the model from the command line.
+- Added additional scripts to plot debug data and performance vs. epoch.
+
 **Dec 21 2016** 
 
 - Refactor of data processing code.

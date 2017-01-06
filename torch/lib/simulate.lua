@@ -325,7 +325,7 @@ function tfluids.simulate(conf, mconf, batch, model, outputDiv)
   -- FPROP the model to perform the pressure projection & velocity calculation.
   local modelOutput = model:forward(torch.getModelInput(batch))
 
-  -- Copy the GPU output back to the CPU (velocity and pressure).
+  -- Copy the final p and U back to the state tensor.
   local pPred, UPred = torch.parseModelOutput(modelOutput)
   p:copy(pPred)
   U:copy(UPred)

@@ -83,6 +83,8 @@ if optim.rmsprop == nil then
 end
 dofile('lib/queue.lua')
 dofile('lib/data_parallel.lua')
+dofile('lib/logger.lua')
+dofile('lib/calc_flops.lua')
 
 torch.setdefaulttensortype('torch.FloatTensor')
 torch.setnumthreads(8)

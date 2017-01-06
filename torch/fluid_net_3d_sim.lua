@@ -36,6 +36,8 @@ dofile("lib/geom_import_binvox.lua")
 local conf = torch.defaultConf()
 conf.batchSize = 1
 conf.loadModel = true
+conf.visualizeData = false
+conf.saveData = true
 conf = torch.parseArgs(conf)  -- Overwrite conf params from the command line.
 assert(conf.batchSize == 1, 'The batch size must be one')
 assert(conf.loadModel == true, 'You must load a pre-trained model')
@@ -129,28 +131,38 @@ gnuplot.hist(UMax, 200)
 --]]
 
 -- ***************************** Create Voxel File ****************************
-local densityFilename = outDir .. '/density_output.vbox'
-local densityFile = torch.DiskFile(densityFilename,'w')
-densityFile:binary()
-densityFile:writeInt(res)
-densityFile:writeInt(res)
-densityFile:writeInt(res)
-densityFile:writeInt(numFrames)
+local densityFile, densityFilename, geomFile, geomFilename
+if conf.saveData then
+  densityFilename = outDir .. '/density_output.vbox'
+  densityFile = torch.DiskFile(densityFilename,'w')
+  densityFile:binary()
+  densityFile:writeInt(res)
+  densityFile:writeInt(res)
+  densityFile:writeInt(res)
+  densityFile:writeInt(numFrames)
+  
+  geomFilename = outDir .. '/geom_output.vbox'
+  geomFile = torch.DiskFile(geomFilename,'w')
+  geomFile:binary()
+  geomFile:writeInt(res)
+  geomFile:writeInt(res)
+  geomFile:writeInt(res)
+  geomFile:writeInt(1)
+end
 
-local geomFilename = outDir .. '/geom_output.vbox'
-local geomFile = torch.DiskFile(geomFilename,'w')
-geomFile:binary()
-geomFile:writeInt(res)
-geomFile:writeInt(res)
-geomFile:writeInt(res)
-geomFile:writeInt(1)
+-- This is pretty aggressive.
+mconf.dt = 0.1
 
--- This is VERY aggressive.
-mconf.dt = 0.4
+local hImage
+if conf.visualizeData then
+  local density = batchGPU.density:mean(2):squeeze()
+  density = density:mean(1):squeeze()  -- Average along Z dimension.
+  hImage = image.display{image = density, zoom = 512 / density:size(1),
+                         gui = false, legend = 'density'}
+end
 
 -- ***************************** SIMULATION LOOP *******************************
 -- Save a 2D slice just to visualize.
-local densityIm = torch.FloatTensor(numFrames, 3, res, res)
 for i = 1, numFrames do
   collectgarbage()
   print('Simulating frame ' .. i .. ' of ' .. numFrames)
@@ -160,26 +172,28 @@ for i = 1, numFrames do
 
   local p, U, geom, density = tfluids.getPUGeomDensityReference(batchGPU)
 
-  -- Save a 2D slice for quick validation (3D rendering is slow).
-  local sliceIndex = math.floor(res / 2)
-  local densityXY = density:select(3, sliceIndex)
-  densityIm[i]:copy(densityXY)
-
-  if i == 1 then
-    geomFile:writeFloat(
-        geom:squeeze():permute(3, 2, 1):float():contiguous():storage())
-    print('  ==> Saved geom to ' .. geomFilename)
+  if conf.saveData then
+    if i == 1 then
+      geomFile:writeFloat(
+          geom:squeeze():permute(3, 2, 1):float():contiguous():storage())
+      print('  ==> Saved geom to ' .. geomFilename)
+    end
+    -- Save greyscale density (so mean across RGB).
+    densityFile:writeFloat(density:mean(2):squeeze():permute(
+        3, 2, 1):float():contiguous():storage())
+    print('  ==> Saved density to ' .. densityFilename)
   end
-  densityFile:writeFloat(
-      density:mean(2):squeeze():permute(3, 2, 1):float():contiguous():storage())
-  print('  ==> Saved density to ' .. densityFilename)
-end
-densityFile:close()
-geomFile:close()
 
-local imStride = 16  -- Plot every 16 frames.
-local nrow = math.ceil(math.sqrt(numFrames / imStride))
-local zoom = 2 / (res / 128)
-image.display{image = strideTensor(densityIm, 1, imStride), nrow = nrow,
-              legend = "XY Density", zoom = zoom}
+  if conf.visualizeData then
+    local density = batchGPU.density:mean(2):squeeze()
+    density = density:mean(1):squeeze():sqrt()
+    image.display{image = density, zoom = 512 / density:size(1),
+                  gui = false, legend = 'density', win = hImage}
+  end
+end
+
+if conf.saveData then
+  densityFile:close()
+  geomFile:close()
+end
 

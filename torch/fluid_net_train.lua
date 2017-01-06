@@ -153,6 +153,12 @@ if conf.profileFPROPTime > 0 then
     niters = niters + 1
   end
   print('    FPROP Time: ' .. 1000 * ((t1 - t0) / niters) .. ' ms / sample')
+
+  -- Also calculate the total FLOPS (with a print out per layer).
+  local verbose = 1  -- Print out only nn nodes (ignore graph containers).
+  local flops, peakMemory = torch.CalculateFlops(model, input, verbose)
+  print('    TOTAL FLOPS: ' .. torch.HumanReadableNumber(flops) .. 'flops')
+
   torch.cleanupModel(model)
 end
 
@@ -168,7 +174,8 @@ if conf.train then
   -- saveParameters dumps conf and mconf to a human readable test file.
   torch.saveParameters(conf, mconf)
 
-  local logger = optim.Logger(conf.modelDirname .. '_log.txt')
+  local logger = torch.Logger(conf.modelDirname .. '_log.txt',
+                              conf.resumeTraining)
   logger:setNames{'trLoss', 'trPLoss', 'trULoss', 'trDivLoss',
                   'trLongTermDivLoss', 'teLoss', 'tePLoss', 'teULoss',
                   'teDivLoss', 'teLongTermDivLoss'}
@@ -245,22 +252,22 @@ gnuplot.plot({'errs', torch.FloatTensor(torch.range(1, #errs)),
 
 -- Now do a more detailed analysis of the test and training sets (including
 -- long term divergence prediction). This is quite slow.
-local nSteps = 128
-local teNormDiv = torch.calcStats(
-    {data = te, conf = conf, mconf = mconf, model = model, nSteps = nSteps})
-torch.save(conf.modelDirname .. '_teNormDiv.bin', teNormDiv)
-local trNormDiv = torch.calcStats(
-    {data = tr, conf = conf, mconf = mconf, model = model, nSteps = nSteps})
-torch.save(conf.modelDirname .. '_trNormDiv.bin', trNormDiv)
-if mattorch ~= nil then
-  mattorch.save(conf.modelDirname .. '_teNormDiv.mat', 
-                {meanDiv = teNormDiv:double()})
-  mattorch.save(conf.modelDirname .. '_trNormDiv.mat',
-                {meanDiv = trNormDiv:double()})
+local function CalcAndDumpStats(data, dataStr)
+  local nSteps = 64  -- Use 128 for paper.
+  local stats = torch.calcStats(
+      {data = data, conf = conf, mconf = mconf, model = model, nSteps = nSteps})
+  local fn = conf.modelDirname .. '_' .. dataStr .. 'Stats.bin'
+  torch.save(fn, stats)
+  print('Saved ' .. fn)
+  if mattorch ~= nil then
+    fn = conf.modelDirname .. '_' .. dataStr .. 'Stats.mat'
+    matStats = stats.histData
+    matStats['normDiv'] = stats.normDiv
+    mattorch.save(fn, matStats)
+    print('Saved ' .. fn)
+  end
 end
+CalcAndDumpStats(te, 'te')
+CalcAndDumpStats(tr, 'tr')
 
---[[
-dofile('utils/plot_weight_histograms.lua')
-local verbosePlot = false
-torch.plotWeightHistograms(_conf, _mconf, _model, _tr, _criterion, verbosePlot)
---]]
+print('ALL DONE!')

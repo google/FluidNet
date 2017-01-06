@@ -19,8 +19,6 @@ local mattorch = torch.loadPackageSafe('mattorch')
 
 -- dofile('lib/load_package_safe.lua')
 
-local dumpDebugData = false  -- set to true to dump a lot of debug data to disk.
-
 -- A single test AND train function (avoid code duplication). When training set
 -- epochType == 'train' and when testing, epochType == 'test'.
 function torch.runEpoch(input)
@@ -62,12 +60,11 @@ function torch.runEpoch(input)
 
   -- For fast debugging, we can reduce the epoch size.
   if conf.maxSamplesPerEpoch < math.huge then
-    local nsamples = math.min(#dataInds, conf.maxSamplesPerEpoch)
+    local nsamples = math.min(dataInds:size(1), conf.maxSamplesPerEpoch)
     dataInds = dataInds[{{1, nsamples}}]
   end
 
-  -- Containers for the current batch, the CPU storage gets filled and then
-  -- transferred in one shot to the GPU.
+  -- Containers for the current batch.
   local batchGPU
   do
     local batchCPU = data:AllocateBatchMemory(conf.batchSize)
@@ -86,19 +83,6 @@ function torch.runEpoch(input)
   local parallel = torch.DataParallel(conf.numDataThreads, data, dataInds,
                                       conf.batchSize, initThreadFunc,
                                       singleThreaded)
-
-  local batchGradNorm = {}
-
-  local function saveBatchGrad()
-    if (mattorch ~= nil and #batchGradNorm > 0) and dumpDebugData then
-      local batchGradNormTensor = torch.DoubleTensor(batchGradNorm)
-      local fn = string.format("%s_batchGradNorm_Epoch%06d.mat",
-                               conf.modelDirname, mconf.epoch)
-      mattorch.save(fn, {batchGradNorm = batchGradNormTensor,
-                         epoch = torch.DoubleTensor({mconf.epoch})})
-      print("  - batch gradient norms saved to " .. fn)
-    end
-  end
 
   if training then
     print('\n==> Training: (gpu ' .. tostring(conf.gpu) .. ')')
@@ -133,7 +117,8 @@ function torch.runEpoch(input)
     if lastBatchErr ~= nil then
       progress_str = string.format('err=%.4e', lastBatchErr)
     end
-    torch.progress(nbatches, nbatchesTotal, progress_str)
+    torch.progress(nbatches * conf.batchSize, nbatchesTotal * conf.batchSize,
+                   progress_str)
 
     -- Get a processed batch. NOTE: they may be out of order since we
     -- process them asynchronously. We only perturb during training.
@@ -190,7 +175,6 @@ function torch.runEpoch(input)
         print('')
         print('WARNING: criterion error (' .. err .. ') is NaN or > ' ..
               errLimit)
-        saveBatchGrad()  -- Dump for debugging...
         error('criterion error is NaN or > 1e3.')
       end
 
@@ -210,8 +194,7 @@ function torch.runEpoch(input)
       -- Finally, we want to calculate the divergence of a future frame (and
       -- in some cases optimize this as well). This means we need to run the
       -- simulation in a loop to calculate the future frame.
-      -- if mconf.longTermDivNumSteps[1] > 0 then
-      if mconf.longTermDivNumSteps ~= nil then
+      if mconf.longTermDivNumSteps ~= nil and mconf.longTermDivLambda > 0 then
         local baseDt = mconf.dt
 
         -- Pick a random timescale.
@@ -248,12 +231,10 @@ function torch.runEpoch(input)
         aveLongTermDivLoss = aveLongTermDivLoss + errLongTermDiv
 
         -- If we're including this in the objective function than also BPROP.
-        if training and mconf.optimizeLongTermDiv then
-          err = err + errLongTermDiv
-          aveLoss = aveLoss + errLongTermDiv
-          local df_do = crit:backward(output, target)
-          model:backward(input, df_do)
-        end
+        err = err + errLongTermDiv
+        aveLoss = aveLoss + errLongTermDiv
+        local df_do = crit:backward(output, target)
+        model:backward(input, df_do)
 
         -- Put the criterion lambdas back.
         -- TODO(tompson): This is a little ugly. Should we have a separate crit?
@@ -269,7 +250,6 @@ function torch.runEpoch(input)
 
       if gradParameters ~= nil then
         local curNorm = gradParameters:norm()
-        batchGradNorm[#batchGradNorm + 1] = curNorm
 
         -- Perform gradient clipping.
         if curNorm > mconf.gradNormThreshold then
@@ -300,8 +280,6 @@ function torch.runEpoch(input)
   end
 
   torch.progress(dataInds:size(1), dataInds:size(1))
-
-  saveBatchGrad()
 
   torch.setDropoutTrain(model, false)
   collectgarbage()

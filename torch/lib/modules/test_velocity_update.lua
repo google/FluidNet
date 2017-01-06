@@ -54,8 +54,8 @@ function test.VelocityUpdateForward()
         depth = torch.random(16, 32)
       end
 
-      local p = torch.rand(bsize, depth, height, width)
-      local geom = torch.rand(bsize, depth, height, width):gt(0.8):double()
+      local p = torch.rand(bsize, 1, depth, height, width)
+      local geom = torch.rand(bsize, 1, depth, height, width):gt(0.8):double()
 
       local mod = nn.VelocityUpdate(matchManta == 1)
       local deltaU = mod:forward({p, geom})
@@ -70,7 +70,8 @@ function test.VelocityUpdateForward()
         deltaUGT:resize(bsize, 3, depth, height, width)
       end
       for b = 1, bsize do
-        torch.calcVelocityUpdate(deltaUGT[b], p[b], geom[b], matchManta == 1)
+        torch.calcVelocityUpdate(deltaUGT[b], p[{b, 1}], geom[{b, 1}],
+                                 matchManta == 1)
       end
 
       local err = deltaUGT - deltaU
@@ -94,8 +95,8 @@ function test.VelocityUpdateBackward()
       else
         depth = torch.random(8, 12)
       end
-      local p = torch.rand(bsize, depth, height, width)
-      local geom = torch.rand(bsize, depth, height, width):gt(0.8):double()
+      local p = torch.rand(bsize, 1, depth, height, width)
+      local geom = torch.rand(bsize, 1, depth, height, width):gt(0.8):double()
       local mod = nn.Sequential()
       -- InjectTensor is a custom module just for this test. It takes in 'p'
       -- and a static 'geom' and simply outputs {p, geom}. It is so that the
@@ -128,8 +129,8 @@ function test.VelocityUpdateCompareFEM()
       depth = torch.random(16, 32)
     end
 
-    local p = torch.rand(bsize, depth, height, width)
-    local geom = torch.zeros(bsize, depth, height, width)
+    local p = torch.rand(bsize, 1, depth, height, width)
+    local geom = torch.zeros(bsize, 1, depth, height, width)
     local matchManta = false
     local mod = nn.VelocityUpdate(matchManta)
     local deltaU = mod:forward({p, geom})
@@ -138,12 +139,12 @@ function test.VelocityUpdateCompareFEM()
 
     mod = nn.Sequential()
     if twoDim == 1 then
+      mod:add(nn.Select(2, 1))
       mod:add(nn.SpatialFiniteElements(1, 1))
       -- The output will be size bsize x 1 x 2 x height x width, we need
       -- bsize x 2 x 1 x height x width.
       mod:add(nn.View(bsize, 2, 1, height, width))
     else
-      mod:add(nn.Unsqueeze(2))
       mod:add(nn.VolumetricFiniteElements(1, 1, 1))
       -- The output will be size bsize x 1 x 3 x depth x height x width, we
       -- need bsize x 3 x depth x height x width.

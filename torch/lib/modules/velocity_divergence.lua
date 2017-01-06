@@ -18,7 +18,7 @@
 -- it uses single sided diff to avoid sampling inside geom cells.
 --
 -- The module takes in a table of {U, geom} and outputs UDiv of size
--- (batch, 2/3, depth, height, width).
+-- (batch, depth, height, width).
 
 local tfluids = require('tfluids')
 
@@ -75,7 +75,8 @@ function VelocityDivergence:type(type)
 end
 
 function VelocityDivergence:clearState()
-  parent.clearState(self)
+  -- parent.clearState(self)  -- EDIT(tompson): This will empty the table.
+  self.output:set()
   self.gradInput[1]:set()
   self.gradInput[2]:set()
   return self

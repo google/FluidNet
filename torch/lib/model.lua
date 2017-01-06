@@ -16,8 +16,6 @@ local nn = require('nn')
 local cudnn = require('cudnn')
 
 local inPlaceReLU = true
--- For ReLU6 you'll have to clone my fork of nn and cunn (relu6 branch).
-local nonlinType = 'relu'  -- Choices are: 'relu', 'relu6', 'sigmoid'.
 
 -- This is the step size for the FEM approximation of gradP. We will verify
 -- this step size against the training data during model instantiation.
@@ -25,82 +23,110 @@ local stepSizeX = 1
 local stepSizeY = 1
 local stepSizeZ = 1
 
--- Construct a dummy model that just copies the last frame's pressure and
--- outputs that. Used for a sanity check.
-function torch.defineBaselineGraph(conf, mconf, data)
-  assert(mconf.twoDim, 'Only 2D supported for now.')
-  local input = nn.Identity()():annotate{name = 'input'}
-  local pDiv = nn.SelectTable(1)(input):annotate{name = 'pDiv'}
-  local UDiv = nn.SelectTable(2)(input):annotate{name = 'UDiv'}
-  local p = nn.Identity()(pDiv)
-  local gradPNet = nn.Sequential()
-  gradPNet:add(nn.SpatialFiniteElements(stepSizeX, stepSizeY))
-  gradPNet:add(nn.Squeeze())  -- output sz (batch x 2 x ydim x xdim)
-  local gradP = gradPNet(p):annotate{name = 'gradP'}
-  local U = nn.CSubTable()({UDiv, gradP}):annotate{name = 'U'}
-  local inputNodes = {input}
-  local outputNodes = {p, U}
-  local model = nn.gModule(inputNodes, outputNodes)
-  return model
-end
-
 function torch.defineModelGraph(conf, mconf, data)
-  local inDims
-  if not mconf.inputPToPModel then
-    if mconf.twoDim then
-      inDims = 3 -- 3D because of U (2D) and geom (1D)
-    else
-      inDims = 4 -- 4D because of U (3D) and geom (1D)
-    end
-  else
-    if mconf.twoDim then
-      inDims = 4 -- 4D because of p (1D) and U (2D) and geom (1D)
-    else
-      inDims = 5 -- 5D because of p (1D) and U (3D) and geom (1D)
-    end 
+  local inDims = 0
+  if mconf.inputChannels.pDiv then
+    inDims = inDims + 1
   end
+  if mconf.inputChannels.UDiv then
+    if mconf.twoDim then
+      inDims = inDims + 2
+    else
+      inDims = inDims + 3
+    end
+  end
+  if mconf.inputChannels.geom then
+    inDims = inDims + 1
+  else
+    error('Are you sure you dont want geometry on input?')
+  end
+  if mconf.inputChannels.div then
+    inDims = inDims + 1
+  end
+
+  print('Number of input channels: ' .. inDims)
+
+  assert((mconf.inputChannels.div or mconf.inputChannels.pDiv or 
+          mconf.inputChannels.UDiv),
+         'Are you sure you dont want any non-geom field info?')
 
   -- Ideally, we should have explicit input nodes for pDiv, UDiv and geom.
   -- However, if one of these nodes does not terminate (i.e. pDiv may or may
   -- not be used), torch will throw an error.
   local input = nn.Identity()():annotate{name = 'input'}
 
-  -- The model expects a table of {p, U, geom}
-  local pDiv
-  if mconf.inputPToPModel then
+  -- The model expects a table of {p, U, geom}. We ALWAYS get these channels
+  -- from the input even if the model does not use them. This way we can
+  -- define a constant API even as the user turns on and off input channels.
+  local pDiv, UDiv, geom, div
+
+  if mconf.inputChannels.pDiv or mconf.addPressureSkip then  
     pDiv = nn.SelectTable(1)(input):annotate{name = 'pDiv'}
   end
-  local UDiv = nn.SelectTable(2)(input):annotate{name = 'UDiv'}
-  local geom = nn.SelectTable(3)(input):annotate{name = 'geom'}
+
+  if mconf.inputChannels.UDiv or mconf.inputChannels.div then
+    UDiv = nn.SelectTable(2)(input):annotate{name = 'UDiv'}
+  end
+
+  if mconf.inputChannels.geom or mconf.inputChannels.div then
+    geom = nn.SelectTable(3)(input):annotate{name = 'geom'}
+  end
+  
+  if mconf.inputChannels.div then
+    local geomScalar = nn.Select(2, 1)(geom)  -- Remove the feat dim
+    local divScalar = nn.VelocityDivergence():cuda()({UDiv, geomScalar})
+    -- Note: Div is now of size (batch x depth x height x width). We need to
+    -- add back the unary feature dimension.
+    div = nn.Unsqueeze(2)(divScalar)
+
+    div:annotate{name = 'div'}
+  end
 
   if mconf.twoDim then
     -- Remove the unary z dimension from each of the input tensors.
     if pDiv ~= nil then
       pDiv = nn.Select(3, 1)(pDiv)
     end
-    UDiv = nn.Select(3, 1)(UDiv)
-    geom = nn.Select(3, 1)(geom)
+    if UDiv ~= nil then
+      UDiv = nn.Select(3, 1)(UDiv)
+    end
+    if geom ~= nil then
+      geom = nn.Select(3, 1)(geom)
+    end
+    if div ~= nil then
+      div = nn.Select(3, 1)(div)
+    end
   end
 
   local pModelInput
-  if mconf.inputPToPModel then
-    pModelInput = nn.JoinTable(2)({pDiv, UDiv, geom})
-  else
-    pModelInput = nn.JoinTable(2)({UDiv, geom})
+  local inputChannels = {}
+  if mconf.inputChannels.pDiv then
+    inputChannels[#inputChannels + 1] = pDiv
   end
+  if mconf.inputChannels.UDiv then
+    inputChannels[#inputChannels + 1] = UDiv
+  end
+  if mconf.inputChannels.div then
+    inputChannels[#inputChannels + 1] = div
+  end
+  if mconf.inputChannels.geom then
+    inputChannels[#inputChannels + 1] = geom
+  end
+
+  local pModelInput = nn.JoinTable(2)(inputChannels)
   pModelInput:annotate{name = 'pModelInput'}
 
   -- Some helper functions.
   local function addNonlinearity(input)
     local nonlin
-    if nonlinType == 'relu6' then
+    if mconf.nonlinType == 'relu6' then
       nonlin = nn.ReLU6(inPlaceReLU)
-    elseif nonlinType == 'relu' then
+    elseif mconf.nonlinType == 'relu' then
       nonlin = nn.ReLU(inPlaceReLU)
-    elseif nonlinType == 'sigmoid' then
+    elseif mconf.nonlinType == 'sigmoid' then
       nonlin = nn.Sigmoid()
     else
-      error('Bad nonlinType.')
+      error('Bad mconf.nonlinType (' .. mconf.nonlinType .. ').')
     end
     print('Adding non-linearity: ' .. nonlin:__tostring() .. ' (inplace ' ..
           tostring(inPlaceReLU) .. ')')
@@ -133,26 +159,70 @@ function torch.defineModelGraph(conf, mconf, data)
     print('Adding batch norm: ' .. bn:__tostring__())
     return bn(input)
   end
-  local function addConv(input, ifeats, ofeats, k, up)
+
+  -- @param interFeats - feature size of the intermediate layers when
+  -- creating a low rank approximation.
+  local function addConv(input, ifeats, ofeats, k, up, rank, interFeats)
+    if rank == nil then
+      assert(interFeats == nil)
+      if mconf.twoDim then
+        rank = 2  -- Default is full rank.
+      else
+        rank = 3  -- Default is full rank.
+      end
+    end
     assert(math.fmod(k, 2) == 1, 'convolution size must be odd')
     local pad = (k - 1) / 2
     local conv
     if mconf.twoDim then
       if up > 1 then
+        assert(rank == 2, 'Upsampling layers must be full rank')
         conv = nn.SpatialConvolutionUpsample(
             ifeats, ofeats, k, k, 1, 1, pad, pad, up, up)
         cudnn.convert(conv, cudnn)  -- Convert the inner convolution to cudnn.
       else
-        conv = cudnn.SpatialConvolution(ifeats, ofeats, k, k, 1, 1, pad, pad)
+        if rank == 1 then
+          conv = nn.Sequential()
+          conv:add(cudnn.SpatialConvolution(
+              ifeats, interFeats, k, 1, 1, 1, pad, 0))
+          conv:add(cudnn.SpatialConvolution(
+              interFeats, ofeats, 1, k, 1, 1, 0, pad))
+        elseif rank == 2 then
+          conv = cudnn.SpatialConvolution(ifeats, ofeats, k, k, 1, 1, pad, pad)
+        else
+          error('rank ' .. rank .. ' is invalid (1 or 2)')
+        end
       end
     else
       if up > 1 then
+        assert(rank == 3, 'Upsampling layers must be full rank')
         conv = nn.VolumetricConvolutionUpsample(
             ifeats, ofeats, k, k, k, 1, 1, 1, pad, pad, pad, up, up, up)
         cudnn.convert(conv, cudnn)  -- Convert the inner convolution to cudnn.
       else
-        conv = cudnn.VolumetricConvolution(ifeats, ofeats, k, k, k, 1, 1, 1,
-                                           pad, pad, pad)
+        if rank == 1 then
+          -- There are LOTS of ways of partitioning the 3D conv into a low rank
+          -- approximation (order, number of features, etc).
+          -- We're just going to arbitrarily choose just one low rank approx.
+          conv = nn.Sequential()
+          conv:add(cudnn.VolumetricConvolution(
+              ifeats, interFeats, k, 1, 1, 1, 1, 1, pad, 0, 0))
+          conv:add(cudnn.VolumetricConvolution(
+              interFeats, interFeats, 1, k, 1, 1, 1, 1, 0, pad, 0))
+          conv:add(cudnn.VolumetricConvolution(
+              interFeats, ofeats, 1, 1, k, 1, 1, 1, 0, 0, pad))
+        elseif rank == 2 then
+          conv = nn.Sequential()
+          conv:add(cudnn.VolumetricConvolution(
+              ifeats, interFeats, k, k, 1, 1, 1, 1, pad, pad, 0))
+          conv:add(cudnn.VolumetricConvolution(
+              interFeats, ofeats, 1, k, k, 1, 1, 1, 0, pad, pad))
+        elseif rank == 3 then
+          conv = cudnn.VolumetricConvolution(
+              ifeats, ofeats, k, k, k, 1, 1, 1, pad, pad, pad)
+        else
+          error('rank ' .. rank .. ' is invalid (1, 2 or 3)')
+        end
       end
     end
     print('Adding convolution: ' .. conv:__tostring__())
@@ -190,61 +260,119 @@ function torch.defineModelGraph(conf, mconf, data)
   local p
   local hl = pModelInput
  
-  local osize, ksize, psize, usize, lastLayerKSize, lastLayerUSize
+  local osize, ksize, psize, usize, rank
+  local interFeats
+
+  local function checkYangSettings(mconf)
+    if mconf.nonlinType ~= 'sigmoid' then
+      error('ERROR: yang model must use nonlinType == "sigmoid"')
+    end
+    if not mconf.inputChannels.pDiv then
+      error('ERROR: yang model must have pDiv input')
+    end
+    if not mconf.inputChannels.div then
+      error('ERROR: yang model must have div input')
+    end
+    if mconf.inputChannels.UDiv then
+      error('ERROR: yang model must not have UDiv input')
+    end
+    if not mconf.inputChannels.geom then
+      error('ERROR: yang model must have geom input')
+    end
+  end
 
   if mconf.twoDim then
-    -- Small model.
-    osize = {16, 32, 32, 64, 64, 32}  -- Conv # output features.
-    ksize = {5, 5, 5, 5, 1, 1}  -- Conv filter size.
-    psize = {2, 1, 1, 1, 1, 1}  -- pooling decimation size (1: no pooling)
-    usize = {1, 1, 1, 1, 1, 1}  -- upsampling size (1 == no upsampling).
+    if mconf.modelType == 'tog' then
+      -- Small model.
+      osize = {16, 32, 32, 64, 64, 32, 1}  -- Conv # output features.
+      ksize = {5, 5, 5, 5, 1, 1, 3}  -- Conv filter size.
+      psize = {2, 1, 1, 1, 1, 1, 1}  -- pooling decimation size (1: no pooling)
+      usize = {1, 1, 1, 1, 1, 1, 2}  -- upsampling size (1 == no upsampling).
+      rank = {2, 2, 2, 2, 2, 2, 2}
+      interFeats = {nil, nil, nil, nil, nil, nil, nil}
 
-    -- The last layer is somewhat special (since the number of osize is always
-    -- 1, we don't ever do pooling and we may or may not concatenate the input
-    -- tensor with the input pressure).
-    lastLayerKSize = 3
-    lastLayerUSize = 2
+      -- Note: upsampling is done WITHIN the conv layer (using
+      -- SpatialConvolutionUpsampling or VolumetricConvolutionUpsampling).
+      -- Therefore you "can" have both upsampling AND pooling in the same layer,
+      -- however this would be silly and so I assert against it (because it's
+      -- probably a mistake).
+    elseif mconf.modelType == 'default' then
+      osize = {16, 16, 16, 16, 1}  -- Conv # output features.
+      ksize = {3, 3, 3, 3, 1}  -- Conv filter size.
+      psize = {1, 1, 1, 1, 1}  -- pooling decimation size (1: no pooling)
+      usize = {1, 1, 1, 1, 1}  -- upsampling size (1 == no upsampling).
+      rank = {2, 2, 2, 2, 2}
+      interFeats = {nil, nil, nil, nil, nil}
+    elseif mconf.modelType == 'yang' then
+      -- From the paper: Data-driven projection method in fluid
+      -- simulation, Yang et al., 2016.
+      -- "In this paper, the neural network has three hidden layers and six
+      -- neurons per hidden layer."      
 
-    -- Note: upsampling is done WITHIN the pooling layer (using
-    -- SpatialConvolutionUpsampling or VolumetricConvolutionUpsampling).
-    -- Therefore you "can" have both upsampling AND pooling in the same layer,
-    -- however this would be silly and so I assert against it (because it's
-    -- probably a mistake).
-
-    -- Large model.
-    --[[
-    osize = {16, 32, 32, 64, 64, 64}  -- Conv # output features.
-    ksize = {7, 7, 5, 5, 1, 1}  -- Conv filter size.
-    psize = {2, 1, 1, 1, 1, 1}  -- pooling decimation size (1: no pooling)
-    usize = {1, 1, 1, 1, 1, 1}  -- upsampling size (1 == no upsampling).
-    lastLayerKSize = 3
-    lastLayerUSize = 2
-    --]]
+      -- Note: the Yang paper defines a per-patch network, however this can
+      -- be exactly mplemented as a "fully-convolutional" network with 1x1x1
+      -- stages for the remaining hidden convolution layers.
+      -- They also use only the surrounding neighbor pixels as input context,
+      -- with p, divergence and geom as input.
+      checkYangSettings(mconf)
+      osize = {6, 6, 6, 1}
+      ksize = {3, 1, 1, 1}  -- They define a per patch network, whic
+      psize = {1, 1, 1, 1}  -- They do not pool or upsample
+      usize = {1, 1, 1, 1}  -- They do not pool or upsample
+      rank = {2, 2, 2, 2}  -- Always full rank.
+      interFeats = {nil, nil, nil, nil}
+    else
+      error('Incorrect modelType for 2D model.')
+    end
   else
-    -- Full (slow) model.
-    --[[
-    osize = {16, 16, 32, 64, 32, 32}
-    ksize = {5, 5, 3, 3, 1, 1}
-    psize = {2, 1, 1, 1, 1, 1}
-    usize = {1, 1, 1, 1, 1, 1}
-    lastLayerKSize = 3
-    lastLayerUSize = 2
-    --]]
-    -- 30fps model.
-    osize = {16, 16, 16, 16, 32, 32}
-    ksize = {3, 3, 3, 3, 1, 1}
-    psize = {2, 2, 1, 1, 1, 1}
-    usize = {1, 1, 1, 1, 1, 2}
-    lastLayerKSize = 3
-    lastLayerUSize = 2
+    if mconf.modelType == 'tog' then
+      -- Fast model.
+      osize = {16, 16, 16, 16, 32, 32, 1}
+      ksize = {3, 3, 3, 3, 1, 1, 3}
+      psize = {2, 2, 1, 1, 1, 1, 1}
+      usize = {1, 1, 1, 1, 1, 2, 2}
+      rank = {3, 3, 3, 3, 3, 3, 3}
+      interFeats = {nil, nil, nil, nil, nil, nil, nil}
+    elseif mconf.modelType == 'default' then
+      osize = {8, 8, 8, 8, 1}
+      ksize = {3, 3, 3, 1, 1}
+      psize = {1, 1, 1, 1, 1}
+      usize = {1, 1, 1, 1, 1}
+      rank = {3, 3, 3, 3, 3}
+      interFeats = {nil, nil, nil, nil, nil}
+    elseif mconf.modelType == 'yang' then
+      checkYangSettings(mconf)
+      osize = {6, 6, 6, 1}
+      ksize = {3, 1, 1, 1}
+      psize = {1, 1, 1, 1}
+      usize = {1, 1, 1, 1}
+      rank = {3, 3, 3, 3}
+      interFeats = {nil, nil, nil, nil}
+   else
+     error('Incorrect modelType for 3D model.')
+   end
   end
+
+  -- NOTE: The last layer is somewhat special (since the number of osize is
+  -- always 1, we don't ever do pooling and we may or may not concatenate
+  -- the input tensor with the input pressure).
+  assert(osize[#osize] == 1, 'Last layer osize must be 1 (pressure)')
+  assert(psize[#psize] == 1, 'Pooling is not allowed in the last layer')
+  if mconf.twoDim then
+    assert(rank[#rank] == 2, 'Last layer must be full rank')
+  else
+    assert(rank[#rank] == 3, 'Last layer must be full rank')
+  end
+
+  print('Model type: ' .. mconf.modelType)
   
   assert(#osize == #ksize and #osize >= 1)
-  for lid = 1, #osize do
+  for lid = 1, #osize - 1 do
     if psize[lid] > 1 then
       assert(usize[lid] == 1, 'Pooling and upsampling in the same layer!')
     end
-    hl = addConv(hl, inDims, osize[lid], ksize[lid], usize[lid])
+    hl = addConv(hl, inDims, osize[lid], ksize[lid], usize[lid], rank[lid],
+                 interFeats[lid])
     hl = addNonlinearity(hl)
     if psize[lid] > 1 then
       hl = addPooling(hl, psize[lid])
@@ -255,34 +383,26 @@ function torch.defineModelGraph(conf, mconf, data)
     inDims = osize[lid]
   end
 
-  if mconf.addPressureSkip and mconf.inputPToPModel then
+  if mconf.addPressureSkip then
     -- Concatenate the input pressure with the current hidden layer.
     hl = nn.JoinTable(2)({hl, pDiv})
     inDims = inDims + 1
   end
 
-  -- Output pressure (1 slice): final conv layer.
-  p = addConv(hl, inDims, 1, lastLayerKSize, lastLayerUSize)
+  -- Output pressure (1 slice): final conv layer. (full rank)
+  p = addConv(hl, inDims, 1, ksize[#ksize], usize[#usize])
 
   -- Final output nodes.
   p:annotate{name = 'p'}
 
   -- Construct a network to calculate the gradient of pressure.
   local matchManta = false
-  local deltaUNet = nn.Sequential()
-  if mconf.twoDim then
-    deltaUNet:add(nn.VelocityUpdate(matchManta))
-    deltaUNet:add(nn.Select(3, 1, 1))  -- Remove the unary z dimension.
-  else
-    -- We need to remove the unary feature dimension from each of the inputs.
-    local par = nn.ParallelTable()
-    par:add(nn.Select(2, 1, 1))  -- Remove from p.
-    par:add(nn.Select(2, 1, 1))  -- Remove from geom.
-    deltaUNet:add(par)
-    deltaUNet:add(nn.VelocityUpdate(matchManta))
-  end
-  local deltaU = deltaUNet({p, geom}):annotate{name = 'deltaU'}
-
+  local deltaUNet = nn.VelocityUpdate(matchManta)
+  -- Manta may have p in some unknown units.
+  -- Therefore we should apply a constant scale to p in order to
+  -- correct U (recall U = UDiv - grad(p)).
+  local pScaled = nn.Mul()(p):annotate{name = 'pScaled'}
+  local deltaU = deltaUNet({pScaled, geom}):annotate{name = 'deltaU'}
   local U = nn.CSubTable()({UDiv, deltaU}):annotate{name = 'U'}
 
   if mconf.twoDim then
@@ -313,12 +433,7 @@ function torch.defineModel(conf, data)
   mconf.netDownsample = 1
 
   -- Start putting together the new model.
-  local model
-  if not mconf.baselineModel then
-    model = torch.defineModelGraph(conf, mconf, data)
-  else
-    model = torch.defineBaselineGraph(conf, mconf, data)
-  end
+  local model = torch.defineModelGraph(conf, mconf, data)
 
   return model, mconf
 end
@@ -340,7 +455,7 @@ function torch.getModelTarget(batch)
 end
 
 function torch.parseModelTarget(target)
-  assert(torch.type(target) == 'table' and #target == 2)
+  assert(torch.type(target) == 'table' and #target == 3, 'Bad target!')
   local pTarget = target[1]
   local UTarget = target[2]
   local geom = target[3]
