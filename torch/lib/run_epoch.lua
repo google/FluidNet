@@ -73,15 +73,10 @@ function torch.runEpoch(input)
 
   -- Create a parallel data container to synchronously create batches (very
   -- important for the 2D model since diskIO becomes the bottleneck).
-  local function initThreadFunc()
-    -- Recall: All threads must be initialized with all classes and packages.
-    dofile('lib/fix_file_references.lua')
-    dofile('lib/load_package_safe.lua')
-    dofile('lib/data_binary.lua')
-  end
   local singleThreaded = false  -- Set to true for easier debugging.
   local parallel = torch.DataParallel(conf.numDataThreads, data, dataInds,
-                                      conf.batchSize, initThreadFunc,
+                                      conf.batchSize,
+                                      torch.DataBinary.initThreadFunc,
                                       singleThreaded)
 
   if training then
@@ -122,10 +117,7 @@ function torch.runEpoch(input)
 
     -- Get a processed batch. NOTE: they may be out of order since we
     -- process them asynchronously. We only perturb during training.
-    local perturbData = conf.trainPerturb.on and training
-    local batch = parallel:getBatch(conf.batchSize, perturbData,
-                                    conf.trainPerturb, mconf.netDownsample,
-                                    conf.dataDir)
+    local batch = parallel:getBatch(conf.batchSize, conf.dataDir)
 
     -- Check we don't double count any samples. This is technically tested
     -- in test_data_parallel.lua, but do it again here just in case.
@@ -198,10 +190,10 @@ function torch.runEpoch(input)
         local baseDt = mconf.dt
 
         -- Pick a random timescale.
-        if conf.trainPerturb.timeScaleSigma > 0 then
+        if mconf.timeScaleSigma > 0 then
           -- note, randn() returns normal distribution with mean 0 and var 1.
           local scale = 1 + math.abs(torch.randn(1)[1] *
-                                     conf.trainPerturb.timeScaleSigma)
+                                     mconf.timeScaleSigma)
           mconf.dt = baseDt * scale
         end
 

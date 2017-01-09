@@ -23,7 +23,7 @@
 --
 -- This module assumes sizeAverage == true.
 --
--- The input is 4D by default (batch x d x h x w).
+-- The input is 5D by default (batch x f x d x h x w).
 
 local MSESICriterion, parent = torch.class('nn.MSESICriterion', 'nn.Criterion')
 

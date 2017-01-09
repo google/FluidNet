@@ -14,7 +14,7 @@ The workflow is:
     - Run mantaflow to generate fluid data.
 2. Train the network in Torch7 (training takes about 1-2 days).
     - Train and validate the model.
-    - (optional) Run 3D example script we used to generate the videos from our paper.
+    - (optional) Run 3D example script to create videos from the paper.
     - (optional) Run 2D real-time demo.
 
 The limitations of the current system are outlined at the end of this doc. Please read it before even considering integrating our code.
@@ -98,6 +98,7 @@ Next, you must build mantaflow using the cmake system.
 cd FluidNet/manta
 mkdir build
 cd build
+sudo apt-get install doxygen libglu1-mesa-dev mesa-common-dev qtdeclarative5-dev qml-module-qtquick-controls
 cmake .. -DGUI='OFF' 
 make -j8
 ```
@@ -116,12 +117,13 @@ Install matlabnoise (https://github.com/jonathantompson/matlabnoise) to the SAME
 To install matlabnoise (with python bindings):
 
 ```
-sudo apt-get install python3.4-dev
+sudo apt-get install python3.5-dev
 sudo apt-get install swig
 git clone git@github.com:jonathantompson/matlabnoise.git
 cd matlabnoise
-sh compile_python3.4_unix.sh
-python3.4 test_python.py
+sh compile_python3.5_unix.sh
+sudo apt-get install python3-matplotlib
+python3.5 test_python.py
 ```
 
 Now you're ready to generate the training data. Make sure the directory `data/datasets/output_current` exists. For the 3D training data run:
@@ -144,11 +146,13 @@ cd FluidNet/manta/build
 **RUNNING TORCH7 TRAINING**
 
 We assume that Torch7 is installed, otherwise follow the instructions [here](
-http://torch.ch/). We use the standard distro with the cuda SDK and cudnn. Note: there may be other libraries we use, so if our torch script fails the first place to look is ``CNNFluilds/torch/lib/include.lua``, and make sure you have all the mandatory libraries.
+http://torch.ch/). We use the standard [distro](https://github.com/torch/distro) with the cuda SDK for cutorch and cunn and [cudnn](https://github.com/soumith/cudnn.torch).
 
-First compile tfluids (this is our custom CUDA & C++ library that implements a large number of the modules used in the paper):
+After install torch, compile tfluids: this is our custom CUDA & C++ library that implements a large number of the modules used in the paper:
 
 ```
+sudo apt-get install freeglut3-dev
+sudo apt-get install libxmu-dev libxi-dev
 cd FluidNet/torch/tfluids
 luarocks make tfluids-1-00.rockspec
 ```
@@ -193,8 +197,6 @@ qlua fluid_net_train.lua --help
 Note: the first time the data is loaded from the manta output, it is cached to 
 the torch/data/ directory.  So if you need to reload new data (because you altered the dataset) then delete the cache files (`torch/data/*.bin`).
 
-Warning: We use a 12GB card for training (Titan X). The 32 batch size used on the 3D model requires only 4.5GB during training but at startup libcudnn allocates huge temporary tensors during the first FPROP. We have seen OS crashes using cudnn when trying to allocate too much memory (i.e. when the batch size is too large). This is a cudnn / driver bug.
-
 **RUNNING THE REAL-TIME DEMO**
 
 For 2D models only! To run the interactive demo firstly compile LuaGL:
@@ -238,34 +240,37 @@ While this codebase is relatively self-contained and full-featured, **it is not 
 
 **RUNTIME**
 
-The entire simulation loop is not optimized; we do not consider it fast enough for real-time applications (and we do not claim this in the paper). This is largely because we have not ported our advection code to the GPU, but also because we have not fully optimized all the components (the ConvNet pressure solve is highly optimized and we quote it's runtime in the paper). The advection code is currently the bottleneck of our system.
-
-However, please keep in mind that the primary contribution of this work is a fast approximation to the pressure solve step. This step is profiled during ``fluid_net_train.lua`` startup. The entire 3D simulation step takes about 80ms, which is not terrible, but we do not consider this fast enough to claim it is real-time. **It would be trivial to implement advection on the GPU and reduce this runtime, but we did not have time.**
+The entire simulation loop is not optimized; however it is fast enough for real-time applications, where good GPU resources are available (i.e. NVidia 1080 or Titan).
 
 **BOUNDARY HANDLING**
 
-Our example boundary condition code is very rudimentary. It isn't a limitation of our system, rather that we have not implemented anything more sophisticated. For now, we use a Tensor mask to set pixels occupied (as geometry) or fluid. The grid boundary is assumed to be an empty region. We also have a tensor mask for pressure, velocity and density to set field values constant (this allows us to set in-flow density or velocity regions).
+Our example boundary condition code is very rudimentary. However, we support the same cell types as Manta (in-flow, empty, occupied, etc), so more complicated boundary conditions can be created. One potential limitation is that the setWallBcs codepath assumes zero velocity occupiers (like Manta does). However, it would be an easy extension to allows internal occupied voxels to have non-zero velocity.
 
 **RENDERING**
 
-We do not have a real-time 3D fluid render. We use an offline render instead. For our 2D "renderer", we simply display the RGB density field to screen and visualize the velocity vectors. It is very rudimentary.
+We do not have a real-time 3D fluid render. We use an offline render instead. For our 2D "renderer", we simply display the RGB density field to screen and visualize the velocity vectors. It is very rudimentary. Incorporating an open-source 3D fluid render is future work.
 
 **SIMULATOR**
 
 The only external forces that are supported are vorticity confinement and buoyancy. Viscosity and gravity are not supported (but could be added easily).
 
-Geometry is assumed to be static (i.e. not moving). Again, this is not a limitation of our approach, we just haven't implemented non-static geometry.
-
-This is not necessarily a limitation, but our velocity update does not match the update from mantaflow. There are some cases where manta does not properly calculate the FD of pressure near geometry boundaries.
-
 **UNIT TESTING**
 
-We have unit tests (including FD gradient checks) for all custom torch modules. However we do not have unit tests for everything in tfluids (some parts are tested, but not all).
+We have unit tests (including FD gradient checks) for all custom torch modules. 
 
 The two main test scripts we do have are:
 
 ```
-qlua FluidNet/torch/lib/modules/test_ALL_MODULES.lua
+cd FluidNet/
+qlua lib/modules/test_ALL_MODULES.lua
+```
+
+and (this one requires us to generate data from manta first):
+
+```
+cd FluidsNet/manta/build
+./manta ../scenes/_testData.py
+cd ../../torch/tfluids
 qlua -ltfluids -e "tfluids.test()"
 ```
 

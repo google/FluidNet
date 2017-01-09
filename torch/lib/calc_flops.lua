@@ -248,13 +248,39 @@ function torch.CalculateFlops(module, input, verbose, depth)
      end
     -- We wont recurse the children. Instead when we encounter an nn.gModule
     -- we use the forwardNodes table to visit all nodes in the graph.
-  elseif moduleType == 'nn.VelocityUpdate' then
+  elseif moduleType == 'tfluids.VelocityUpdate' then
     -- This is VERY rough (from a cursory glance at tfluids/generic/tfluids.cc).
     flops = inputNumel * 10
     peakMemory = inputNumel + outputNumel
-  elseif moduleType == 'nn.VelocityDivergence' then
+  elseif moduleType == 'tfluids.SetWallBcs' then
+    -- This is VERY rough (from a cursory glance at tfluids/generic/tfluids.cc).
+    flops = inputNumel * 2
+    peakMemory = inputNumel + outputNumel
+  elseif moduleType == 'tfluids.VelocityDivergence' then
     -- This is also VERY rough.
     flops = inputNumel * 8
+    peakMemory = inputNumel + outputNumel
+  elseif moduleType == 'nn.StandardDeviation' then
+    print('WARNING: Not estimating flops for nn.StandardDeviation')
+    flops = 0
+    peakMemory = inputNumel + outputNumel
+  elseif moduleType == 'nn.Clamp' then
+    flops = 2 * inputNumel
+    peakMemory = inputNumel + outputNumel
+  elseif moduleType == 'nn.ApplyScale' then
+    flops = 2 * inputNumel
+    peakMemory = inputNumel + outputNumel
+  elseif moduleType == 'tfluids.FlagsToOccupancy' then
+    flops = 0
+    peakMemory = inputNumel + outputNumel
+  elseif moduleType == 'nn.Mul' then
+    flops = 1 * inputNumel
+    peakMemory = inputNumel + outputNumel
+  elseif moduleType == 'nn.VolumetricAveragePooling' then
+    flops = outputNumel * module.kW * module.kH * module.kT
+    peakMemory = inputNumel + outputNumel
+  elseif moduleType == 'tfluids.VolumetricUpSamplingNearest' then
+    flops = 0  -- Just a copy.
     peakMemory = inputNumel + outputNumel
   else
     error('Module type ' .. moduleType .. ' is not supported')
@@ -269,7 +295,7 @@ function torch.CalculateFlops(module, input, verbose, depth)
       else
         moduleStr = moduleType
       end
-      print(spaces .. torch.HumanReadableNumber(flops) .. 'flops: ' .. 
+      print(spaces .. torch.HumanReadableNumber(flops) .. ' flops: ' .. 
             moduleStr)
       print(spaces .. '  --> ' .. 
             string.format('%.2fMB', peakMemory * bytesToMB) .. ' peak bytes')

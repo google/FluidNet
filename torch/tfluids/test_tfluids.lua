@@ -13,594 +13,1086 @@
 -- limitations under the License.
 
 -- Adhoc testing for our utility functions.
+--
+-- Note: these tests MUST be run from the FluidNet/torch/tfluids directory!
 
 -- You can easily test specific units like this:
--- qlua -ltfluids -e "tfluids.test{'calcVelocityDivergenceCUDA'}"
+-- qlua -ltfluids -lenv -e "tfluids.test{'velocityDivergence'}"
 
 -- Or to test everything:
--- qlua -ltfluids -e "tfluids.test()"
+-- qlua -ltfluids -lenv -e "tfluids.test()"
 
-local cutorch = require('cutorch')
+local nn = require('nn')
+local paths = require('paths')
+local sys = require('sys')
 
 torch.setdefaulttensortype('torch.DoubleTensor')
 torch.setnumthreads(8)
 
 -- Create an instance of the test framework
-local precision = 1e-5
-local loosePrecision = 2e-4
+local precision = 1e-6
+local precisionCPUGPU = 1e-5  -- All in floats.
+local loosePrecision = 1e-4
 local mytester = torch.Tester()
 local test = torch.TestSuite()
 local times = {}
-local profileTimeSec = 1
+local profileTimeSec = 1  -- Probably too small for any real profiling...
+local profileResolution = 128
+local jac = nn.Jacobian
 
-function test.MoveImpulseWithinImage2D()
-  local methods = {'euler', 'rk2'}
-  for _, method in pairs(methods) do
-    local d = 1
-    local w = torch.random(5, 10)
-    local h = torch.random(5, 10)
-    local s = torch.zeros(d, h, w)
-    -- Create an impulse.
-    local u = torch.random(2, w - 1)
-    local v = torch.random(2, h - 1)
-    s[{1, v, u}] = 1
-    -- Move the impulse to another location in the image by advecting it.
-    local dx = torch.random(-u + 1, w - u)
-    local dy = torch.random(-v + 1, h - v)
-    -- Add a tiny offset so it is not EXACTLY in the center.
-    local vel = torch.zeros(2, d, h, w)
-    vel[1]:fill(dx + torch.rand(1)[1] * 2e-5 - 1e-5)
-    vel[2]:fill(dy + torch.rand(1)[1] * 2e-5 - 1e-5)
-    local dt = 1
-    local geom = torch.zeros(d, h, w)
-    local sM = s:clone():fill(0)
-    tfluids.advectScalar(dt, s, vel, geom, sM, method)
-    local uM = u + dx
-    local vM = v + dy
-    -- Make sure we did keep the ground truth location on the image.
-    assert(vM >= 1 and vM <= h and uM >= 1 and uM <= w, 'Test logic error')
-    mytester:eq(sM[{1, vM, uM}], 1, 1e-4, 'Bad (1) position!')
-    sM[{1, vM, uM}] = 0
-    -- Now the whole thing should be zeros.
-    mytester:asserteq(sM:min(), 0, 'Bad position!')
-    mytester:assertlt(sM:max(), 1e-4, 'Bad position!') 
+local function tileToResolution(x, res)
+  assert(torch.isTensor(x) and x:dim() == 5)
+  local is3D = x:size(3) > 1
+  local ntile = {}
+  for i = 1, 3 do
+    ntile[i] = math.ceil(res / x:size(2 + i))
+    assert(ntile[i] > 1, 'tileToResolution can only upscale')
   end
+  if not is3D then
+    ntile[1] = 1
+  end
+  x = x:repeatTensor(1, 1, ntile[1], ntile[2], ntile[3]):contiguous()
+  if not is3D then
+    x = x[{{}, {}, {}, {1, res}, {1, res}}]:contiguous()
+  else
+    x = x[{{}, {}, {1, res}, {1, res}, {1, res}}]:contiguous()
+  end
+  return x
 end
 
-function test.ScalarAdvectionLinear()
-  -- TODO(tompson): Finish this.
-end
-
-local function profileCuda(func, name, args)
+-- Result args is an optional array of argument indices that are result
+-- tensors, i.e. the output of the function is stored in these tensors.
+-- We will fill these tensors with random to make sure that the GPU and
+-- CPU versions MUST overwrite them to be correct. Use 'nil' if all the
+-- arguments are inputs.
+local function profileAndTestCuda(func, name, args, resultArgs,
+                                  resizeForProfile)
+  if not tfluids.withCUDA then
+    print('WARNING: tfluids compiled without cuda. Not testing.')
+    return
+  end
+  local cutorch = require('cutorch')
+  if resizeForProfile == nil then
+    resizeForProfile = true
+  end
   local tm = {}
   times[name] = tm
 
-  -- Profile CPU (convert tensors to float for a fair comparison).
+  -- Make a copy of the input arguments on the GPU and CPU (as float)
+  local argsInGPU = {}
+  local argsInCPU = {}
   for key, value in pairs(args) do
     if torch.isTensor(value) then
-      args[key] = value:float()
+      if value:type() == 'torch.CudaTensor' then
+        argsInGPU[key] = value:clone()
+      else
+        argsInGPU[key] = value:cuda()  -- Implicit clone.
+      end
+      if value:type() == 'torch.FloatTensor' then
+        argsInCPU[key] = value:clone()
+      else
+        argsInCPU[key] = value:float()  -- Implicit clone.
+      end
+    else
+      argsInGPU[key] = value
+      argsInCPU[key] = value
     end
   end
-  local a = torch.Timer()
-  local count = 0
-  while a:time().real < profileTimeSec do
-    count = count + 1
-    func(unpack(args))
+
+  if resultArgs ~= nil then
+    for _, key in pairs(resultArgs) do
+      argsInCPU[key]:uniform()
+      argsInGPU[key]:uniform()
+    end
   end
-  tm.cpu = a:time().real / count
+
+  args = nil  -- We no longer need it.
+
+  -- Now call the CPU function.
+  local resCPU = {func(unpack(argsInCPU))}  -- Capture multiple return args.
+
+  -- Now call the GPU function.
+  local resGPU = {func(unpack(argsInGPU))}
+
+  assert(#resCPU == #resGPU)
+
+  -- Make sure all the input args are now the same (if modified in place).
+  for key, value in pairs(argsInCPU) do
+    if torch.isTensor(value) then
+      local err = argsInCPU[key] - argsInGPU[key]:float()
+      mytester:assertlt(err:abs():max(), precisionCPUGPU,
+                        'Error CPU:GPU mismatch: ' .. name .. ', arg # ' .. key)
+    else
+      -- This is pedantic, but do it anyway.
+      mytester:assert(argsInCPU[key] == argsInGPU[key])
+    end
+  end
+
+  -- Make sure the return value is the same. Note: this will break 
+  for key, value in pairs(resCPU) do
+    if torch.isTensor(value) then
+      local err = resCPU[key] - resGPU[key]:float()
+      mytester:assertlt(err:abs():max(), precisionCPUGPU,
+                        'Error CPU:GPU mismatch: ' .. name)
+    else
+      -- This is pedantic, but do it anyway.
+      mytester:assert(resCPU[key] == resGPU[key])
+    end
+  end
+
+  if resizeForProfile then
+    -- Now resize the arrays to something more reasonable for profiling.
+    for key, value in pairs(argsInCPU) do
+      if torch.isTensor(value) and value:dim() == 5 then
+        -- Upscale by tiling. Technically we don't really care what the values
+        -- are when profiling, but this will at least keep them from being NaNs
+        -- and with reasonable flag values.
+        argsInCPU[key] = tileToResolution(argsInCPU[key], profileResolution)
+        argsInGPU[key] = tileToResolution(argsInGPU[key], profileResolution)
+      end
+    end
+  end
+
+  -- Profile CPU.
+  local count = 0
+  sys.tic()
+  while sys.toc() < profileTimeSec do
+    count = count + 1
+    func(unpack(argsInCPU))
+  end
+  tm.cpu = sys.toc() / count
 
   -- Profile GPU.
-  for key, value in pairs(args) do
-    if torch.isTensor(value) then
-      args[key] = value:cuda()
-    end
-  end
-  a:reset()
-  while a:time().real < profileTimeSec do
+  count = 0
+  sys.tic()
+  while sys.toc() < profileTimeSec do
     count = count + 1
-    func(unpack(args))
-  end   
-  tm.gpu = a:time().real / count
-end
-
-function test.averageBorderCellsCUDA()
-  -- TODO(tompson): Write a test of the forward function.
-
-  -- Test that the float and cuda implementations are the same.
-  local nchan = {2, 3}
-  local d = {1, torch.random(32, 64)}
-  local w = torch.random(32, 64)
-  local h = torch.random(32, 64)
-  local case = {'2D', '3D'}
-
-  for testId = 1, 2 do
-    -- 2D and 3D cases.
-    local geom = torch.rand(d[testId], h, w):gt(0.8):float()
-    local input = torch.rand(nchan[testId], d[testId], h, w):float()
-    local outputCPU = input:clone()
-
-    -- Perform the function on the CPU.
-    tfluids.averageBorderCells(input, geom, outputCPU)
-
-    -- Perform the function on the GPU.
-    local outputGPU = input:cuda()
-    tfluids.averageBorderCells(input:cuda(), geom:cuda(), outputGPU)
-
-    -- Compare the results.
-    local maxErr = (outputCPU - outputGPU:float()):abs():max()
-    mytester:assertlt(maxErr, precision,
-                      'averageBorderCells CUDA ERROR ' .. case[testId])
-
-    profileCuda(tfluids.averageBorderCells,
-                'averageBorderCells' .. case[testId], {input, geom, outputCPU})
+    func(unpack(argsInGPU))
   end
+  cutorch.synchronize()
+  tm.gpu = sys.toc() / count
 end
 
-function test.vorticityConfinementCUDA()
-  -- TODO(tompson): Write a test of the forward function.
+local function assertNotAllEqual(tensor)
+  -- Make sure we load samples from file that aren't all the same, otherwise
+  -- we're not really testing the batch dimension.
+  if tensor:size(1) == 1 then
+    return  -- Only one sample, so it's correct.
+  end
+  local first = tensor[{{1}}]
+  local others = tensor[{{2, tensor:size(1)}}]
+  assert((others - first:expandAs(others)):abs():max() > 1e-5,
+         'All samples equal!')
+end
 
-  -- Test that the float and cuda implementations are the same.
-  local nchan = {2, 2, 3, 3}
-  local d = {1, 1, torch.random(32, 64), torch.random(32, 64)}
-  local w = torch.random(32, 64)
-  local h = torch.random(32, 64)
-  local scale = torch.uniform(0.5, 1)  -- in [0.5, 1]
-  local dt = torch.uniform(0.5, 1)
-  local case = {'2D', '2DGEOM', '3D', '3DGEOM'}
-  local incGeom = {false, true, false,  true}
-
-  for testId = 1, #nchan do
-    -- 2D and 3D cases.
-    local geom
-    if not incGeom[testId] then
-      geom = torch.zeros(d[testId], h, w):float()
+-- A shorthand to call torch.loadMantaFile on multiple files to concat them
+-- into a single batch.
+local function loadMantaBatch(fn)
+  local files = torch.ls('test_data/b*_' .. fn)
+  assert(#files == 16, 'Hard-coded just in case something stupid happens')
+  
+  local p = {}
+  local U = {}
+  local flags = {}
+  local density = {}
+  local is3D = nil
+  for _, file in pairs(files) do
+    local curP, curU, curFlags, curDensity, curIs3D = torch.loadMantaFile(file)
+    p[#p + 1] = curP
+    U[#U + 1] = curU
+    flags[#flags + 1] = curFlags
+    density[#density + 1] = curDensity
+    if is3D == nil then
+      is3D = curIs3D
     else
-      geom = torch.rand(d[testId], h, w):gt(0.8):float()
+      assert(is3D == curIs3D)
     end
-
-    local U = torch.rand(nchan[testId], d[testId], h, w):float()
-    local magCurl = geom:clone():fill(0)
-    local curl
-    if nchan[testId] == 2 then
-      curl = geom:clone()
-    else
-      curl = U:clone()
-    end
-    local UCPU = U:clone()
-
-    -- Perform the function on the CPU.
-    tfluids.vorticityConfinement(dt, scale, UCPU, geom, curl, magCurl)
-
-    -- Perform the function on the GPU.
-    local UGPU = U:cuda()
-    local curlGPU = curl:cuda():fill(0)
-    local magCurlGPU = magCurl:cuda():fill(0)
-    tfluids.vorticityConfinement(dt, scale, UGPU, geom:cuda(), curlGPU,
-                                 magCurlGPU)
-
-    -- Compare the results.
-    local maxErr = (curlGPU:float() - curl):abs():max()
-    mytester:assertlt(maxErr, precision,
-                      ('vorticityConfinementZeroGeom CUDA curl ERROR ' ..
-                       case[testId]))
-    maxErr = (magCurlGPU:float() - magCurl):abs():max()
-    mytester:assertlt(maxErr, precision,
-                      ('vorticityConfinementZeroGeom CUDA magCurl ERROR ' ..
-                       case[testId]))
-    maxErr = (UCPU - UGPU:float()):abs():max()
-    mytester:assertlt(maxErr, precision,
-                      ('vorticityConfinementZeroGeom CUDA ERROR ' ..
-                       case[testId]))
-
-    profileCuda(tfluids.vorticityConfinement,
-                'vorticityConfinementZeroGeom' .. case[testId],
-                {dt, scale, U, geom, curl, magCurl})
   end
+  p = torch.cat(p, 1)
+  U = torch.cat(U, 1)
+  flags = torch.cat(flags, 1)
+  density = torch.cat(density, 1)
+
+  local function assertNotAllEqual(tensor)
+    -- Make sure we load samples from file that aren't all the same, otherwise
+    -- we're not really testing the batch dimension.
+    assert(tensor:size(1) > 1, 'only one sample')
+    local first = tensor[{{1}}]
+    local others = tensor[{{2, tensor:size(1)}}]
+    assert((others - first:expandAs(others)):abs():max() > 1e-5,
+           'All samples equal!')
+  end
+
+  return p, U, flags, density, is3D
 end
 
-function test.calcVelocityUpdateCUDA()
-  -- NOTE: The forward function test is split between:
-  -- torch/utils/test_calc_velocity_update.lua and
-  -- torch/lib/modules/test_velocity_update.lua
+function test.advect()
+  for dim = 2, 3 do
+    -- Load the pre-advection Manta file for this test.
+    local fn = dim .. 'd_initial.bin'
+    local _, U, flags, density, is3D = loadMantaBatch(fn)
+    assertNotAllEqual(U)
+    assertNotAllEqual(flags)
+    assertNotAllEqual(density)
 
-  -- Test that the float and cuda implementations are the same.
-  local batchSize = torch.random(1, 3)
-  local nchan = {2, 3, 2, 3}
-  local d = {1, torch.random(32, 64), 1, torch.random(32, 64)}
-  local w = torch.random(32, 64)
-  local h = torch.random(32, 64)
-  local case = {'2D', '3D', '2DMatchManta', '3DMatchManta'}
-  local matchManta = {false, false, true, true}
+    assert(is3D == (dim == 3))
 
-  for testId = 1, 4 do
-    -- 2D and 3D cases.
-    local geom = torch.rand(batchSize, d[testId], h, w):gt(0.8):float()
-    local p = torch.rand(batchSize, d[testId], h, w):float()
-    local outputCPU =
-        torch.rand(batchSize, nchan[testId], d[testId], h, w):float()
+    -- Now do advection using the 2 parameters and check against Manta.
+    for order = 1, 2 do
+      -- Load the Manta ground truth.
+      local openStr = 'False'  -- It actually doesn't affect advection.
+      fn = (dim .. 'd_advect_openBounds_' .. openStr .. '_order_' .. order ..
+            '.bin')
+      local _, UManta, flagsDiv, densityManta, is3D = loadMantaBatch(fn)
+      assert(is3D == (dim == 3))
+      assert(torch.all(torch.eq(flags, flagsDiv)), 'flags changed!')
 
-    -- Perform the function on the CPU.
-    tfluids.calcVelocityUpdate(outputCPU, p, geom, matchManta[testId])
+      -- Make sure that Manta didn't change the flags.
+      assert((flags - flagsDiv):abs():max() == 0, 'Flags changed!')
 
-    -- Perform the function on the GPU.
-    local outputGPU = outputCPU:clone():fill(math.huge):cuda()
-    tfluids.calcVelocityUpdate(outputGPU, p:cuda(), geom:cuda(),
-                               matchManta[testId])
-
-    -- Compare the results.
-    local maxErr = (outputCPU - outputGPU:float()):abs():max()
-    mytester:assertlt(maxErr, precision,
-                      'calcVelocityUpdate CUDA ERROR ' .. case[testId])
-
-    -- Now test the backwards call.
-    local gradOutput =
-      torch.rand(batchSize, nchan[testId], d[testId], h, w):float()
-
-    local gradPCPU = p:clone():fill(math.huge)
-    tfluids.calcVelocityUpdateBackward(gradPCPU, p, geom, gradOutput,
-                                       matchManta[testId])
-
-    local gradPGPU = p:clone():fill(math.huge):cuda()
-    tfluids.calcVelocityUpdateBackward(gradPGPU, p:cuda(), geom:cuda(),
-                                       gradOutput:cuda(), matchManta[testId])
-
-    maxErr = (gradPCPU - gradPGPU:float()):abs():max()
-    mytester:assertlt(maxErr, precision,
-                      'calcVelocityUpdateBackward CUDA ERROR ' .. case[testId])
-
-    profileCuda(tfluids.calcVelocityUpdate,
-                'calcVelocityUpdate' .. case[testId],
-                {outputCPU, p, geom, matchManta[testId]})
-
-    profileCuda(tfluids.calcVelocityUpdateBackward,
-                'calcVelocityUpdateBackward' .. case[testId],
-                {gradPCPU, p, geom, gradOutput, matchManta[testId]})
-  end
-end
-
-function test.advectScalarCUDA()
-  -- Test that the float and cuda implementations are the same.
-  for sampleIntoGeom = 0, 1 do
-    for dim = 2, 3 do
-      local dt = torch.uniform(0.5, 1)
-      local d
-      if dim == 2 then
-        d = 1
+      -- Perform our own advection.
+      local dt = 0.1  -- Unfortunately hard coded for now.
+      local boundaryWidth = 0  -- Also shouldn't be hard coded.
+      local method
+      if order == 1 then
+        method = 'euler'
       else
-        d = torch.random(32, 64)
+        method = 'maccormack'
       end
-      local h = torch.random(32, 64)
-      local w = torch.random(32, 64)
-      local methods = {'euler', 'rk2'}
- 
-      local p = torch.rand(d, h, w):float()
-      -- Mul rand by 10 to get reasonable coverage over multiple cells.
-      local u = torch.rand(dim, d, h, w):mul(5):float()
-      local geom = torch.rand(d, h, w):gt(0.8):float()
 
-      p:cmul(1 - geom)  -- Zero out geometry cells.
-  
-      for _, method in pairs(methods) do
-        local caseStr = ('advectScalar - method: ' .. method .. ', dim: ' ..
-                         dim .. ', sampleIntoGeom: ' .. sampleIntoGeom)
-  
-        -- Perform advection on the CPU.
-        local pDst = p:clone():fill(0)
-        tfluids.advectScalar(dt, p, u, geom, pDst, method,
-                             sampleIntoGeom == 1)
-  
-        -- Perform advection on the GPU.
-        local pDstGPU = p:clone():fill(0):cuda()
-        tfluids.advectScalar(dt, p:cuda(), u:cuda(), geom:cuda(), pDstGPU,
-                             method, sampleIntoGeom == 1)
-        
-        local maxErr = (pDst - pDstGPU:float()):abs():max()
-        -- TODO(tompson): It's troubling that we need loose precision here.
-        -- Maybe it's OK, but it is never-the-less surprising.
+      local nameS = ('tfluids.advectScalar dim ' .. dim .. ', order ' ..
+                    order)
+      local nameU = ('tfluids.advectVel dim ' .. dim .. ', order ' ..
+                    order)
 
-        -- NOTE: This might actually fail sometimes (rarely, but I've seen
-        -- it happen). This is because floating point roundoff can cause rays
-        -- to brush past geometry cells but not actually trigger intersections. 
-        mytester:assertlt(maxErr, loosePrecision, 'ERROR: ' .. caseStr)
+      -- Note: the clone's here are to make sure every inner loops
+      -- sees completely independent data.
+      local densityAdv =
+          torch.rand(unpack(density:size():totable())):typeAs(density)
+      tfluids.advectScalar(dt, density:clone(), U:clone(), flags:clone(),
+                           method, densityAdv, boundaryWidth)
+      local err = densityManta - densityAdv
+      mytester:assertlt(err:abs():max(), precision, 'Error: ' .. nameS)
 
-        profileCuda(tfluids.advectScalar, caseStr,
-                    {dt, p, u, geom, pDst, method, sampleIntoGeom == 1})
-      end
+      -- Also try an in-place scalar advection.
+      densityAdv = density:clone()
+      tfluids.advectScalar(dt, densityAdv, U:clone(), flags:clone(),
+                           method, nil, boundaryWidth)
+      local err = densityManta - densityAdv
+      mytester:assertlt(err:abs():max(), precision, 'Error: ' .. nameS)
+
+      local UAdv =
+          torch.rand(unpack(U:size():totable())):typeAs(U)
+      tfluids.advectVel(dt, U:clone(), flags:clone(), method, UAdv,
+                        boundaryWidth)
+      err = UManta - UAdv
+      mytester:assertlt(err:abs():max(), precision, 'Error: ' .. nameU)
+
+      -- Also try an in-place velocity advection.
+      local UAdv = U:clone()
+      tfluids.advectVel(dt, UAdv, flags:clone(), method, nil, 
+                        boundaryWidth)
+      err = UManta - UAdv
+      mytester:assertlt(err:abs():max(), precision, 'Error: ' .. nameU)
+
+      -- Now test and profile the CUDA version.
+      profileAndTestCuda(tfluids.advectScalar, nameS,
+                         {dt, density, U, flags,
+                          method, densityAdv, boundaryWidth}, {6})
+
+      profileAndTestCuda(tfluids.advectVel, nameU,
+                         {dt, U, flags, method, U:clone():fill(0),
+                          boundaryWidth}, {5})
     end
   end
 end
 
-function test.advectVelCUDA()
-  -- Test that the float and cuda implementations are the same.
+local function createJacobianTestData(p, U, flags, density)
+  assert(U ~= nil, 'At least U must be non-nil')
+  local is3D = U:size(2) == 3
+  local zStart = 1
+  local zSize
+  if is3D then
+    -- In 3D a Jacobian of numel * numel is too big! Do a slice of the
+    -- z dimension.
+    zSize = 4
+  else
+    zSize = U:size(3)
+  end
+  -- Also do a slice of bsize.
+  local bsize = math.min(U:size(1), 3)
+  if p ~= nil then
+    p = p:narrow(3, zStart, zSize):contiguous():double()
+    p = p:narrow(1, 1, bsize):contiguous():double()
+  end
+  U = U:narrow(3, zStart, zSize):contiguous():double()
+  U = U:narrow(1, 1, bsize):contiguous():double()
+  if flags ~= nil then
+    flags = flags:narrow(3, zStart, zSize):contiguous():double()
+    flags = flags:narrow(1, 1, bsize):contiguous():double()
+    -- Make sure the flags array is still interesting (i.e that there
+    -- is obstacles).
+    assert((flags - tfluids.CellType.TypeFluid):abs():max() > 0,
+           'All cells are fluid.')
+  end
+  if density ~= nil then
+    density = density:narrow(3, zStart, zSize):contiguous():double()
+    density = density:narrow(1, 1, bsize):contiguous():double()
+  end
+  return p, U, flags, density
+end
+
+local function createJacobianTestModel(mod, flags)
+  local testMod = nn.Sequential()
+  -- InjectTensor is a specially designed cell that inputs a tensor and
+  -- outputs a table of {tensor, flags}. It is so that the input output
+  -- function looks like a tensor to tensor op (where flags are constant).
+  testMod:add(nn.InjectTensor(flags))
+  testMod:add(mod)
+  return testMod
+end
+
+function test.setWallBcs()
+  local function testSetWallBcs(dim, fnInput, fnOutput)
+    local fn = dim .. 'd_' .. fnInput
+print(fn)  -- TEMP CODE
+    local _, U, flags, _, is3D = loadMantaBatch(fn)
+    assertNotAllEqual(U)
+    assertNotAllEqual(flags)
+
+    assert(is3D == (dim == 3))
+
+print(flags:size()) -- TEMP CODE
+
+    -- Make sure they're not all fluid cells (i.e. that there is some obstacles
+    -- in the sub-set) otherwise we're not testing anything.
+    assert((flags - tfluids.CellType.TypeFluid):abs():max() > 0,
+           'All cells are fluid!')
+
+    fn = dim .. 'd_' .. fnOutput
+    local _, UManta, flagsManta, _, is3D = loadMantaBatch(fn)
+    assert(is3D == (dim == 3))
+    assert(torch.all(torch.eq(flags, flagsManta)), 'flags changed!')
+
+print('our own') -- TEMP CODE
+
+    -- Perform our own setWallBcs
+    local UOurs = U:clone()
+    tfluids.setWallBcsForward(UOurs, flags)
+    local err = UOurs - UManta
+    mytester:assertlt(err:abs():max(), precision,
+                      'Error: tfluids.setWallBcs dim ' .. dim)
+
+print('test module')  -- TEMP CODE
+
+    -- Test the same forward function but in the module.
+    local mod = createJacobianTestModel(tfluids.SetWallBcs(), flags):float()
+    err = mod:forward(U) - UManta
+    mytester:assertlt(err:abs():max(), precision,
+                     'Error: tfluids.setWallBcs FPROP dim ' .. dim)
+
+print('BPROP')  -- TEMP CODE
+
+    local _, UBprop, flagsBprop, _ = createJacobianTestData(nil, U, flags, nil)
+    local mod = createJacobianTestModel(tfluids.SetWallBcs(), flagsBprop)
+    err = jac.testJacobian(mod, UBprop)
+    mytester:assertlt(math.abs(err), precision,
+                      'Error: tfluids.setWallBcs BPROP dim ' .. dim)
+
+print('profile')  -- TEMP CODE
+
+    -- Now test and profile the CUDA version.
+    profileAndTestCuda(tfluids.setWallBcsForward,
+                       'setWallBcsForward_' .. dim .. 'd',
+                       {U, flags})
+  end
+
   for dim = 2, 3 do
-    local dt = torch.uniform(0.5, 1)
-    local d
+    -- We call setWallBcs three times in the Manta training code so we should
+    -- test it in all cases.
+    testSetWallBcs(dim, 'advect.bin', 'setWallBcs1.bin')
+    testSetWallBcs(dim, 'vorticityConfinement.bin', 'setWallBcs2.bin')
+    testSetWallBcs(dim, 'solvePressure.bin', 'setWallBcs3.bin')
+  end
+end
+
+function test.velocityDivergence()
+  for dim = 2, 3 do
+    -- Load the input Manta data.
+    local fn = dim .. 'd_vorticityConfinement.bin'
+    local _, U, flags, _, is3D = loadMantaBatch(fn)
+    assertNotAllEqual(U)
+    assertNotAllEqual(flags)
+
+    assert(is3D == (dim == 3))
+    -- Now load the output Manta data. Note: in manta/scenes/_testData.py the
+    -- rhs (i.e. divergence) is stored in the pressure channel of our binary
+    -- format.
+    fn = dim .. 'd_makeRhs.bin'
+    local divManta, UManta, flagsManta, _, is3D = loadMantaBatch(fn)
+    assert(is3D == (dim == 3))
+    assert(torch.all(torch.eq(U, UManta)), 'Velocity changed!')
+    assert(torch.all(torch.eq(flags, flagsManta)), 'flags changed!')
+
+    -- Perform our own divergence calculation.
+    local divOurs =
+        torch.rand(unpack(divManta:size():totable())):typeAs(divManta)
+    tfluids.velocityDivergenceForward(U:clone(), flags:clone(), divOurs)
+    local err = divManta - divOurs
+    mytester:assertlt(err:abs():max(), precision,
+                      ('Error: tfluids.velocityDivergenceForward dim ' ..
+                       dim))
+
+    -- Test the same forward function but in the module.
+    local mod = createJacobianTestModel(tfluids.VelocityDivergence(),
+                                        flags):float()
+    err = mod:forward(U) - divManta
+    mytester:assertlt(err:abs():max(), precision,
+                     'Error: tfluids.velocityDivergence FPROP dim ' .. dim)
+
+    local _, UBprop, flagsBprop, _ = createJacobianTestData(nil, U, flags, nil)
+    local mod = createJacobianTestModel(tfluids.VelocityDivergence(),
+                                        flagsBprop)
+    err = jac.testJacobian(mod, UBprop)
+    mytester:assertlt(math.abs(err), precision,
+                      'Error: tfluids.velocityDivergence BPROP dim ' .. dim)
+
+    -- Now test and profile the CUDA version.
+    profileAndTestCuda(tfluids.velocityDivergenceForward,
+                       'velocityDivergenceForward_' .. dim .. 'd',
+                       {U, flags, divOurs}, {3})
+    local gradOutput = divOurs:clone():uniform(0, 1)
+    local gradU = U:clone()
+    profileAndTestCuda(tfluids.velocityDivergenceBackward,
+                       'velocityDivergenceBackward_' .. dim .. 'd',
+                       {U, flags, gradOutput, gradU}, {4})
+  end
+end
+
+function test.velocityUpdate()
+  for dim = 2, 3 do
+    -- Load the input Manta data.
+    local fn = dim .. 'd_vorticityConfinement.bin'
+    local _, U, flags, _, is3D = loadMantaBatch(fn)
+    assertNotAllEqual(U)
+    assertNotAllEqual(flags)
+
+    assert(is3D == (dim == 3))
+    -- Now load the output Manta data.
+    fn = dim .. 'd_correctVelocity.bin'
+    local pressure, UManta, flagsManta, _, is3D = loadMantaBatch(fn)
+    assert(is3D == (dim == 3))
+    assert(torch.all(torch.eq(flags, flagsManta)), 'flags changed!')
+
+    -- Make sure this isn't a trivial velocity update (i.e. that velocities
+    -- actually changed).
+    assert((U - UManta):abs():max() > 1e-5, 'No velocities changed in Manta!')
+
+    -- Perform our own velocity update calculation.
+    local UOurs = U:clone()  -- This is the divergent U.
+    tfluids.velocityUpdateForward(UOurs, flags:clone(), pressure:clone())
+    local err = UManta - UOurs
+    mytester:assertlt(err:abs():max(), precision,
+                      ('Error: tfluids.velocityUpdateForward dim ' ..
+                       dim))
+
+    -- Test the same forward function but in the module.
+    local mod = createJacobianTestModel(tfluids.VelocityUpdate(),
+                                        {U, flags}):float()
+    err = mod:forward(pressure) - UManta
+    mytester:assertlt(err:abs():max(), precision,
+                     'Error: tfluids.velocityUpdate FPROP dim ' .. dim)
+
+    local pressureBprop, UBprop, flagsBprop, _ =
+        createJacobianTestData(pressure, U, flags, nil)
+    local mod = createJacobianTestModel(tfluids.VelocityUpdate(),
+                                        {UBprop, flagsBprop})
+    err = jac.testJacobian(mod, pressureBprop)
+    mytester:assertlt(math.abs(err), precision,
+                      'Error: tfluids.velocityUpdate BPROP dim ' .. dim)
+
+    -- Now test and profile the CUDA version.
+    profileAndTestCuda(tfluids.velocityUpdateForward,
+                       'velocityUpdateForward_' .. dim .. 'd',
+                       {UOurs, flags, pressure})
+    local gradOutput = U:clone():uniform(0, 1)
+    local gradP = pressure:clone()
+    profileAndTestCuda(tfluids.velocityUpdateBackward,
+                       'velocityUpdateBackward_' .. dim .. 'd',
+                       {U, flags, pressure, gradOutput, gradP}, {5})
+  end
+end
+
+function test.vorticityConfinement()
+  for dim = 2, 3 do
+    -- Load the input Manta data.
+    local fn = dim .. 'd_buoyancy.bin'
+    local _, U, flags, _, is3D = loadMantaBatch(fn)
+    assertNotAllEqual(U)
+    assertNotAllEqual(flags)
+
+    assert(is3D == (dim == 3))
+    -- Now load the output Manta data.
+    fn = dim .. 'd_vorticityConfinement.bin'
+    local _, UManta, flagsManta, _, is3D = loadMantaBatch(fn)
+    assert(is3D == (dim == 3))
+    assert(torch.all(torch.eq(flags, flagsManta)), 'flags changed!')
+
+    -- Make sure this isn't a trivial velocity update (i.e. that velocities
+    -- actually changed).
+    assert((U - UManta):abs():max() > 1e-5, 'No velocities changed in Manta!')
+
+    -- Perform our own velocity update calculation.
+    -- A note here: it would seem like the vort confinement calculation is
+    -- sensitive to float precision (likely due to the norm calls). We can do
+    -- the test here in doubles (as the Manta sim did) and then convert to float
+    -- for comparison.
+    local UOurs = U:clone():double()  -- This is the divergent U.
+    local strength = tfluids.getDx(flags)
+    tfluids.vorticityConfinement(UOurs, flags:clone():double(), strength)
+    local err = UManta - UOurs:float()
+    mytester:assertlt(err:abs():max(), precision,
+                      ('Error: tfluids.vorticityConfinement dim ' .. dim))
+    
+    -- Now test and profile the CUDA version.
+    profileAndTestCuda(tfluids.vorticityConfinement, 
+                       'vorticityConfinement_' .. dim .. 'd',           
+                       {UOurs, flags, strength})
+  end
+end
+
+function test.addBuoyancy()
+  for dim = 2, 3 do
+    -- Load the input Manta data.
+    local fn = dim .. 'd_setWallBcs1.bin'
+    local _, U, flags, density, is3D = loadMantaBatch(fn)
+    assertNotAllEqual(U)  
+    assertNotAllEqual(flags)
+    assertNotAllEqual(density)
+
+    assert(is3D == (dim == 3))
+    -- Now load the output Manta data.
+    fn = dim .. 'd_buoyancy.bin'
+    local _, UManta, flagsManta, _, is3D = loadMantaBatch(fn)
+    assert(is3D == (dim == 3))
+    assert(torch.all(torch.eq(flags, flagsManta)), 'flags changed!')
+
+    -- Make sure this isn't a trivial velocity update (i.e. that velocities
+    -- actually changed). 
+    assert((U - UManta):abs():max() > 1e-5, 'No velocities changed in Manta!')
+
+    -- Perform our own velocity update calculation.
+    local UOurs = U:clone()  -- This is the divergent U.
+    local gStrength = tfluids.getDx(flags) / 4
+    local gravity = torch.FloatTensor({1, 2, 3})
     if dim == 2 then
-      d = 1
-    else
-      d = torch.random(32, 64)
+      gravity[3] = 0
     end
-    local h = torch.random(32, 64)
-    local w = torch.random(32, 64)
-    local methods = {'euler', 'rk2'}  
+    gravity:div(gravity:norm()):mul(gStrength)
+    local dt = 0.1
+    tfluids.addBuoyancy(UOurs, flags:clone(), density:clone(), gravity, dt)
+    local err = UManta - UOurs
+    mytester:assertlt(err:abs():max(), precision,
+                      ('Error: tfluids.addBuoyancy dim ' .. dim))
 
-    -- Mul rand by 10 to get reasonable coverage over multiple cells.
-    local u = torch.rand(dim, d, h, w):mul(5):float()
-    local geom = torch.rand(d, h, w):gt(0.8):float()
-
-    for _, method in pairs(methods) do
-      local caseStr = ('advectVel - method: ' .. method .. ', dim: ' .. dim)
-
-      -- Perform advection on the CPU.
-      local uDst = u:clone():fill(0) 
-      tfluids.advectVel(dt, u, geom, uDst, method)
-
-      -- Perform advection on the GPU.
-      local uDstGPU = u:clone():fill(0):cuda()
-      tfluids.advectVel(dt, u:cuda(), geom:cuda(), uDstGPU, method)
-      
-      local maxErr = (uDst - uDstGPU:float()):abs():max()
-      -- TODO(tompson): It's troubling that we need loose precision here.
-      -- Maybe it's OK, but it is never-the-less surprising.
-
-      -- NOTE: This might actually fail sometimes (rarely, but I've seen
-      -- it happen). This is because floating point roundoff can cause rays
-      -- to brush past geometry cells but not actually trigger intersections. 
-      mytester:assertlt(maxErr, loosePrecision, 'ERROR: ' .. caseStr)
-
-      profileCuda(tfluids.advectVel, caseStr, {dt, u, geom, uDst, method})
-    end
+    -- Now test and profile the CUDA version.
+    profileAndTestCuda(tfluids.addBuoyancy,
+                       'addBuoyancy_' .. dim .. 'd',  
+                       {UOurs, flags, density, gravity, dt})
   end
 end
 
---[[
-function test.solveLinearSystemPCGCUDA()
-  local batchSize = torch.random(1, 3)
-  local w = torch.random(32, 64)
-  local h = torch.random(32, 64)
+function test.emptyDomain()
   for dim = 2, 3 do
-    local d
-    if dim == 3 then
-      d = torch.random(32, 64)
-    else
-      d = 1
+    local nbatch = torch.random(1, 4)
+    local bnd = torch.random(1, 3)
+    local width = torch.random(bnd * 2 + 1, 12)
+    local height = torch.random(bnd * 2 + 1, 12)
+    local depth = torch.random(bnd * 2 + 1, 12)
+    if dim == 2 then
+      depth = 1
     end
 
-    -- Create some random inputs.
-    local geom = torch.rand(batchSize, d, h, w):gt(0.8):cuda()
-    local p = torch.rand(batchSize, d, h, w):cuda()
-    local U = torch.rand(batchSize, dim, d, h, w):cuda()
+    local flags = torch.Tensor(nbatch, 1, depth, height, width)
+    tfluids.emptyDomain(flags, dim == 3, bnd)
+    
+    local flagsGT = torch.Tensor(nbatch, 1, depth, height, width)
+    flagsGT:fill(tfluids.CellType.TypeFluid)
+    local obs = tfluids.CellType.TypeObstacle
+    flagsGT[{{}, {}, {}, {}, {1, bnd}}]:fill(obs)
+    flagsGT[{{}, {}, {}, {}, {width - bnd + 1, width}}]:fill(obs)
+    flagsGT[{{}, {}, {}, {1, bnd}, {}}]:fill(obs)
+    flagsGT[{{}, {}, {}, {height - bnd + 1, height}, {}}]:fill(obs)
+    if dim == 3 then
+      flagsGT[{{}, {}, {1, bnd}, {}, {}}]:fill(obs)
+      flagsGT[{{}, {}, {depth - bnd + 1, depth}, {}, {}}]:fill(obs)
+    end
 
-    -- Allocate the output tensor.
-    local deltaU = torch.CudaTensor(batchSize, dim, d, h, w)
-
-    -- Call the forward function.
-    tfluids.solveLinearSystemPCG(deltaU, p, geom, U)
-
-    -- TODO(kris): Check the output.
+    mytester:assert(torch.all(torch.eq(flagsGT, flags)),
+                    'emptyDomain CPU error')
+    
+    -- Now test and profile on the GPU.
+    profileAndTestCuda(tfluids.emptyDomain, 'emptyDomain_' .. dim .. 'd',
+                       {flags, dim == 3, bnd}, {1})
   end
 end
---]]
 
-function test.calcVelocityDivergenceCUDA()
-  -- NOTE: The forward and backward function tests are in:
-  -- torch/lib/modules/test_velocity_divergence.lua
+function test.flagsToOccupancy()
+  for dim = 2, 3 do
+    local nbatch = torch.random(1, 4)
+    local width = torch.random(6, 12)
+    local height = torch.random(6, 12)
+    local depth = torch.random(6, 12)
+    if dim == 2 then
+      depth = 1
+    end
 
-  -- Test that the float and cuda implementations are the same.
-  local batchSize = torch.random(1, 3)
-  local nchan = {2, 3}
-  local d = {1, torch.random(32, 64)}
-  local w = torch.random(32, 64)
-  local h = torch.random(32, 64)
-  local case = {'2D', '3D'}
+    local occupancy = torch.Tensor(nbatch, 1, depth, height, width):random(0, 1)
+    local flags = occupancy:clone():fill(0)
 
-  for testId = 1, 2 do
-    local geom = torch.rand(batchSize, d[testId], h, w):gt(0.8):float()
-    local U = torch.rand(batchSize, nchan[testId], d[testId], h, w):float()
-    local UDivCPU = geom:clone():fill(0)
-    
-    -- Perform the function on the CPU.
-    tfluids.calcVelocityDivergence(U, geom, UDivCPU)
+    local pocc = occupancy:data()
+    local pflags = flags:data()
+    local numel = occupancy:numel()
 
-    -- Perform the function on the GPU. 
-    local UDivGPU = UDivCPU:clone():fill(math.huge):cuda()
-    tfluids.calcVelocityDivergence(U:cuda(), geom:cuda(), UDivGPU)
+    local fluid = tfluids.CellType.TypeFluid
+    local occ = tfluids.CellType.TypeObstacle
+    for i = 0, numel - 1 do
+      if pocc[i] == 0 then
+        pflags[i] = fluid
+      else
+        pflags[i] = occ
+      end
+    end
 
-    -- Compare the results.
-    local maxErr = (UDivCPU - UDivGPU:float()):abs():max()
-    mytester:assertlt(maxErr, precision,
-                      'calcVelocityDivergence CUDA ERROR ' .. case[testId])
+    local occupancyOut = occupancy:clone():fill(-1)
+    tfluids.flagsToOccupancy(flags, occupancyOut)
+    mytester:assert(torch.all(torch.eq(occupancy, occupancyOut)),
+                    'flagsToOccupancy CPU error')
+
+    -- Try it in our module.
+    local mod = tfluids.FlagsToOccupancy()
+    local occupancyMod = mod:forward(flags)
+    mytester:assert(torch.all(torch.eq(occupancy, occupancyMod)),
+                    'flagsToOccupancy module error')
+
+    -- Now test and profile on the GPU.
+    profileAndTestCuda(tfluids.flagsToOccupancy,
+                       'flagsToOccupancy_' .. dim .. 'd',
+                       {flags, occupancyOut}, {2})
+  end
+end
+
+function test.VolumetricUpSamplingNearest()
+  local batchSize = torch.random(1, 5)
+  local nPlane = torch.random(1, 5)
+  local widthIn = torch.random(5, 8)
+  local heightIn = torch.random(5, 8)
+  local depthIn = torch.random(5, 8)
+  local ratio = torch.random(2, 3)  -- We should probably test '1' as well...
+
+  local module = tfluids.VolumetricUpSamplingNearest(ratio)
+
+  local input = torch.rand(batchSize, nPlane, depthIn, heightIn, widthIn)
+  local output = module:forward(input):clone()
+
+  assert(output:dim() == 5)
+  assert(output:size(1) == batchSize)
+  assert(output:size(2) == nPlane)
+  assert(output:size(3) == depthIn * ratio)
+  assert(output:size(4) == heightIn * ratio)
+  assert(output:size(5) == widthIn * ratio)
+
+  local outputGT = torch.Tensor():resizeAs(output)
+  for b = 1, batchSize do
+    for f = 1, nPlane do
+      for z = 1, depthIn * ratio do
+        local zIn = math.floor((z - 1) / ratio) + 1
+        for y = 1, heightIn * ratio do
+          local yIn = math.floor((y - 1) / ratio) + 1
+          for x = 1, widthIn * ratio do
+            local xIn = math.floor((x - 1) / ratio) + 1
+            outputGT[{b, f, z, y, x}] = input[{b, f, zIn, yIn, xIn}]
+          end
+        end
+      end
+    end
+  end
+
+  -- Note FPROP should be exact (it's just a copy).
+  mytester:asserteq((output - outputGT):abs():max(), 0, 'error on fprop')
+
+  -- Generate a valid gradInput (we'll use it to test the GPU implementation).
+  local gradOutput = torch.rand(batchSize, nPlane, depthIn * ratio,
+                                heightIn * ratio, widthIn * ratio);
+  local gradInput = module:backward(input, gradOutput):clone()
+
+  -- Perform the function on the GPU.
+  if tfluids.withCUDA then
+    module:cuda()
+    local inputGPU = input:cuda()
+    local outputGPU = module:forward(inputGPU):double()
+    mytester:assertle((output - outputGPU):abs():max(), precision,
+                      'error on GPU fprop')
+
+    local gradInputGPU =
+        module:backward(inputGPU, gradOutput:cuda()):double()
+    mytester:assertlt((gradInput - gradInputGPU):abs():max(), precision * 10,
+                      'error on GPU bprop')
+  end
+
+  -- Check BPROP is correct.
+  module:double()
+  local err = jac.testJacobian(module, input)
+  mytester:assertlt(err, precision,
+                    'error on bprop\nsize in:\n' .. tostring(input:size()) ..
+                    '\nsize out:\b' .. tostring(module.output:size()))
+
+  -- Profile the FPROP.
+  local res = math.floor(128 / ratio)
+  local input = torch.FloatTensor(4, 8, res, res, res):uniform(0, 1)
+  local output = torch.FloatTensor(4, 8, res * ratio, res * ratio, res * ratio)
+  profileAndTestCuda(tfluids.volumetricUpSamplingNearestForward,
+                     'volumetricUpSamplingNearestForward',
+                     {ratio, input, output}, {3}, false)
   
-    -- Now test the backwards call.
-    local gradOutput =
-      torch.rand(batchSize, d[testId], h, w):float()
-  
-    local gradUCPU = U:clone():fill(math.huge)
-    tfluids.calcVelocityDivergenceBackward(gradUCPU, U, geom, gradOutput)
-  
-    local gradUGPU = U:clone():fill(math.huge):cuda()
-    tfluids.calcVelocityDivergenceBackward(gradUGPU, U:cuda(), geom:cuda(),
-                                       gradOutput:cuda())
+  -- Profile the BPROP.
+  local gradOutput = output:clone():uniform(0, 1)
+  local gradInput = input:clone()
+  profileAndTestCuda(tfluids.volumetricUpSamplingNearestBackward,
+                     'volumetricUpSamplingNearestBackward',
+                     {ratio, input, gradOutput, gradInput}, {4}, false)
+end
 
-    maxErr = (gradUCPU - gradUGPU:float()):abs():max()
-    mytester:assertlt(
-        maxErr, precision, 'calcVelocityDivergenceBackward CUDA ERROR ' ..
-        case[testId])
+function test.solveLinearSystemPCG()
+  for dim = 2, 3 do
+    for _, precondType in pairs({'none', 'ilu0', 'ic0'}) do
+      -- Load the test data before the solvePressure call.
+      -- Note: you need to run manta/scenes/_testData.py to generate the
+      -- data for this test.
+      local fn = dim .. 'd_setWallBcs2.bin'
+      local _, UDiv, flagsDiv, _, is3DDiv = loadMantaBatch(fn)
+      assertNotAllEqual(UDiv)
+      assertNotAllEqual(flagsDiv)
+  
+      -- Load the ground truth pressure after solvePressure in manta.
+      fn = dim .. 'd_solvePressure.bin'
+      local pManta, UManta, flags, rhsManta, is3D = loadMantaBatch(fn)
+ 
+      assert((flagsDiv - flags):abs():max() == 0, 'Flags changed!')
+      assert(is3D == (dim == 3), '3D boolean is inconsistent')
+      assert(is3D == is3DDiv, '3D boolean is inconsistent (before/after solve)')
+  
+      -- Calculate the divergence (the RHS of the linear system).
+      -- Note that 'our velocityDivergenceForward' == 'manta makeRhs'.
+      local div = flags:clone()
+      tfluids.velocityDivergenceForward(UDiv, flags, div)
+ 
+      mytester:assertlt((rhsManta - div):abs():max(), precision,
+                        'PCG: Our divergence (rhs) is wrong.')
+  
+      -- Note: no need to call setWallBcs as the test data already has had this
+      -- called.
+  
+      -- Call the forward function. Note: solveLinearSystemPCG is only
+      -- implemented in CUDA.
+      local p = flags:clone():uniform(0, 1):cuda()
+      local tol = 1e-5
+      local maxIter = 1000
+      local verbose = false
+      local residual = tfluids.solveLinearSystemPCG(
+          p, flags:cuda(), div:cuda(), dim == 3, tol, maxIter, precondType,
+          verbose)
+  
+      -- This next test MIGHT fail, if we hit max_iter.
+      mytester:assertlt(residual, tol * 2,
+                        'PCG residual ' .. residual .. ' high')
 
-    profileCuda(tfluids.calcVelocityDivergence,
-                'calcVelocityDivergence' .. case[testId], {U, geom, UDivCPU})
-    
-    profileCuda(tfluids.calcVelocityDivergenceBackward,
-                'calcVelocityDivergenceBackward' .. case[testId],
-                {gradUCPU, U, geom, gradOutput})
+      local isNan = p:ne(p)
+      mytester:assertlt(isNan:sum(), 1, 'pressure contains nan values!')
+
+      -- Remove any arbitrary constant from both ours and Manta's pressure.
+      p = p:float()
+      -- Pressure test removed for now. There are some examples with a very
+      -- ill-posed A where Manta's pressure is arbitrarily different. Overall
+      -- as long as div(U) is small, we don't care if our pressure is a little
+      -- off.
+      --[[
+      local bsz = p:size(1)
+      local pMean = p:view(bsz, -1):mean(2):view(bsz, 1, 1, 1, 1)
+      p = p - pMean:expandAs(p)
+      local pMantaMean = pManta:view(bsz, -1):mean(2):view(bsz, 1, 1, 1, 1)
+      pManta = pManta - pMantaMean:expandAs(pManta)
+      local pTol = 1e-2
+      mytester:assertlt((p - pManta):abs():max(), pTol,
+                        'PCG pressure error.')
+      --]]
+  
+      -- Now calculate the velocity update using this new pressure and
+      -- the subsequent divergence.
+      local UNew = UDiv:clone()
+      tfluids.velocityUpdateForward(UNew, flags, p)
+      local UDivNew = flags:clone():uniform(0, 1)
+      tfluids.velocityDivergenceForward(UNew, flags, UDivNew)
+      mytester:assertlt(UDivNew:abs():max(), 1e-4,
+                        'PCG divergence error after velocityupdate! dim ' ..
+                        dim .. ' precondType ' .. precondType)
+      mytester:assertlt((UNew - UManta):abs():max(), 1e-4,
+                        'PCG velocity error after velocityUpdate! dim ' ..
+                        dim .. ' precondType ' .. precondType)
+    end  
+  end
+end
+
+function test.solveLinearSystemJacobi()
+  for dim = 2, 3 do
+    local fn = dim .. 'd_setWallBcs2.bin'
+    local _, UDiv, flagsDiv, _, is3DDiv = loadMantaBatch(fn)
+    assertNotAllEqual(UDiv)
+    assertNotAllEqual(flagsDiv)
+
+    fn = dim .. 'd_solvePressure.bin'
+    local pManta, UManta, flags, rhsManta, is3D = loadMantaBatch(fn)
+
+    assert((flagsDiv - flags):abs():max() == 0, 'Flags changed!')
+    assert(is3D == (dim == 3), '3D boolean is inconsistent')
+    assert(is3D == is3DDiv, '3D boolean is inconsistent (before/after solve)')
+
+    -- Calculate the divergence (the RHS of the linear system).
+    -- Note that 'our velocityDivergenceForward' == 'manta makeRhs'.
+    local div = flags:clone()
+    tfluids.velocityDivergenceForward(UDiv, flags, div)
+    mytester:assertlt((rhsManta - div):abs():max(), precision,
+                      'Jacobi: our divergence (rhs) is wrong.')
+    -- Note: no need to call setWallBcs as the test data already has had this
+    -- called.
+
+    -- Call the forward function. Note: solveLinearSystemJacobi is only
+    -- implemented in CUDA.
+    local p = flags:clone():uniform(0, 1):cuda()
+    local pTol = 0
+    local maxIter = 100000  -- It has VERY slow convergence. Run for long time.
+    local verbose = false
+    local residual = tfluids.solveLinearSystemJacobi(
+        p, flags:cuda(), div:cuda(), dim == 3, pTol, maxIter, verbose)
+
+    mytester:assertlt(residual, 1e-4, 'Jacobi residual ' .. residual .. ' high')
+    p = p:float()
+    local pPrecision = 1e-4
+    if dim == 3 then
+      pPrecision = 1e-2
+    end
+    -- Note: Jacobi takes a REALLY long to settle any non-zero pressure
+    -- constant. This is because the relaxation has to settle everywhere.
+    -- However, constant pressure is completely ignored during the velocity
+    -- update (since we take grad(p)). Therefore we're free to subtract off
+    -- any pressure mean from ours and manta's solution and still have a valid
+    -- test.
+    -- Pressure test removed for now. There are some examples with a very
+    -- ill-posed A where Manta's pressure is arbitrarily different. Overall
+    -- as long as div(U) is small, we don't care if our pressure is a little
+    -- off.
+    --[[
+    local bsz = p:size(1)
+    local pMean = p:view(bsz, -1):mean(2):view(bsz, 1, 1, 1, 1)
+    p = p - pMean:expandAs(p)
+    local pMantaMean = pManta:view(bsz, -1):mean(2):view(bsz, 1, 1, 1, 1)
+    pManta = pManta - pMantaMean:expandAs(pManta)
+    mytester:assertlt((p - pManta):abs():max(), pPrecision,
+                      'Jacobi pressure error.')
+    --]]
+
+    -- Now calculate the velocity update using this new pressure and
+    -- the subsequent divergence.
+    local UNew = UDiv:clone()
+    tfluids.velocityUpdateForward(UNew, flags, p)
+    local UDivNew = flags:clone():uniform(0, 1)
+    tfluids.velocityDivergenceForward(UNew, flags, UDivNew)
+    mytester:assertlt(UDivNew:abs():max(), 1e-5,
+                      'Jacobi divergence error after velocityupdate.')
+    mytester:assertlt((UNew - UManta):abs():max(), 1e-4,
+                      'Jacobi velocity error after velocityUpdate.')
   end
 end 
 
-function test.interpField()
-  local d = torch.random(8, 16)
-  local h = torch.random(8, 16)
-  local w = torch.random(8, 16)
-  local eps = 1e-6
+function test.rectangularBlur()
+  for dim = 2, 3 do
+    local nbatch = torch.random(1, 3)
+    local nchan = 3
+    local zsize = 1
+    if dim == 3 then
+      zsize = 64
+    end
+    ysize = 65
+    xsize = 66
 
-  local geom = torch.zeros(d, h, w)
-  local field = torch.rand(d, h, w)
+    local blurRad = torch.random(1, 4)
 
-  -- Center of the first cell.
-  local pos = torch.Tensor({0, 0, 0})
-  local val = tfluids.interpField(field, geom, pos)
-  mytester:asserteq(val, field[{1, 1, 1}], 'Bad interp value')
+    local src = torch.Tensor(nbatch, nchan, zsize, ysize, xsize):uniform(0, 1)
+    local dst = src:clone():uniform(0, 1)  -- Fill it with random stuff.
+    local is3D = dim == 3
 
-  -- Center of the last cell.
-  pos = torch.Tensor({w - 1, h - 1, d - 1})
-  val = tfluids.interpField(field, geom, pos)
-  mytester:asserteq(val, field[{-1, -1, -1}], 'Bad interp value')
-  
-  -- The corner of the grid should also be the center of the first cell.
-  pos = torch.Tensor({-0.5 + eps, -0.5 + eps, -0.5 + eps})
-  val = tfluids.interpField(field, geom, pos)
-  mytester:asserteq(val, field[{1, 1, 1}], 'Bad interp value')
+    tfluids.rectangularBlur(src, blurRad, is3D, dst)
 
-  -- The right edge of the first cell should be the average of the two.
-  pos = torch.Tensor({0.5, 0, 0})
-  val = tfluids.interpField(field, geom, pos)
-  mytester:asserteq(val, field[{1, 1, {1, 2}}]:mean(), 'Bad interp value')
-
-  -- The top edge of the first cell should be the average of the two.
-  pos = torch.Tensor({0, 0.5, 0})
-  val = tfluids.interpField(field, geom, pos)
-  mytester:asserteq(val, field[{1, {1, 2}, 1}]:mean(), 'Bad interp value')
-
-  -- The back edge of the first cell should be the average of the two.
-  pos = torch.Tensor({0, 0, 0.5})
-  val = tfluids.interpField(field, geom, pos)
-  mytester:asserteq(val, field[{{1, 2}, 1, 1}]:mean(), 'Bad interp value')
-
-  -- The corner of the first cell should be the average of all the neighbours.
-  pos = torch.Tensor({0.5, 0.5, 0.5})
-  val = tfluids.interpField(field, geom, pos)
-  mytester:asserteq(val, field[{{1, 2}, {1, 2}, {1, 2}}]:mean(),
-                    'Bad interp value')
-
-  -- TODO(tompson,kris): Is this enough test cases?
-end
-
-function test.setObstacleBcs()
-  local nchan = {2, 3}
-  local d = {1, torch.random(32, 64)}
-  local w = torch.random(32, 64)
-  local h = torch.random(32, 64)
-
-  for testId = 1, 2 do
-    local twoDim = nchan[testId] == 2
-    local geom = torch.zeros(d[testId], h, w)
-    local U = torch.rand(nchan[testId], d[testId], h, w)
-
-    -- Make a contiguous chunk of geometry.
-    local istart = 16
-    local iend = 20
-    local i0 = (istart - 1) - 0.5 - 1e-6  -- The geom face in 0-index coords.
-    local i1 = (iend - 1) + 0.5 + 1e-6  -- The geom face in 0-index coords.
-    local ic = (iend + istart) * 0.5 - 1  -- Center in 0-index coords.
-    if not twoDim then
-      geom[{{16, 20}, {16, 20}, {16, 20}}]:fill(1)
+    -- Now use a Spatial/VolumetricConvolution stage to replicate the same.
+    -- Our blur kernel clamps the edge values, we should do the same.
+    local k = blurRad * 2 + 1
+    local mod
+    if dim == 2 then
+      mod = nn.SpatialConvolution(1, 1, k, k, 1, 1)  -- fin, fout, kW/H, dW/H
     else
-      geom[{1, {16, 20}, {16, 20}}]:fill(1)
+      mod = nn.VolumetricConvolution(1, 1, k, k, k, 1, 1, 1)
+    end
+    mod.weight:fill(1):div(mod.weight:sum())
+    mod.bias:fill(0)
+    
+    local pad = k - 1
+    
+    local srcPad
+    if dim == 2 then
+      srcPad = torch.Tensor(nbatch, nchan, zsize, ysize + pad, xsize + pad)
+    else
+      srcPad = torch.Tensor(nbatch, nchan, zsize + pad, ysize + pad,
+                            xsize + pad)
+    end
+    for z = 1, srcPad:size(3) do
+      local zsrc = math.min(math.max(z - pad / 2, 1), src:size(3))
+      for y = 1, srcPad:size(4) do
+        local ysrc = math.min(math.max(y - pad / 2, 1), src:size(4))
+        for x = 1, srcPad:size(5) do
+          local xsrc = math.min(math.max(x - pad / 2, 1), src:size(5))
+          srcPad[{{}, {}, z, y, x}]:copy(src[{{}, {}, zsrc, ysrc, xsrc}])
+        end
+      end
+    end
+    local dstGT = dst:clone():uniform(0, 1)
+    for i = 1, nchan do
+      if dim == 2 then
+        dstGT[{{}, i}]:copy(mod:forward(srcPad[{{}, {i}, 1, {}, {}}]))
+      else
+        dstGT[{{}, i}]:copy(mod:forward(srcPad[{{}, {i}, {}, {}, {}}]))
+      end
     end
 
-    -- Set the internal U values.
-    tfluids.setObstacleBcs(U, geom)
-
-    -- Now interpolate a value at one of the geometry faces and make sure
-    -- the velocity component is zero.
-    -- Left face.
-    local pos = torch.Tensor({i0, ic, ic})  -- Recall: 0-indexed.
-    if twoDim then
-      pos[3] = 0
-    end
-    local Ux = tfluids.interpField(U[1], geom, pos)
-    mytester:assertlt(math.abs(Ux), 1e-5, 'Bad face velocity value ' .. testId)
-
-    -- Right face.
-    pos = torch.Tensor({i1, ic, ic})  -- Recall: 0-indexed.
-    if twoDim then
-      pos[3] = 0
-    end
-    Ux = tfluids.interpField(U[1], geom, pos)
-    mytester:assertlt(math.abs(Ux), 1e-5, 'Bad face velocity value ' .. testId)
-
-    -- Bottom face.
-    pos = torch.Tensor({ic, i0, ic})  -- Recall: 0-indexed.
-    if twoDim then
-      pos[3] = 0
-    end
-    local Uy = tfluids.interpField(U[2], geom, pos)
-    mytester:assertlt(math.abs(Uy), 1e-5, 'Bad face velocity value ' .. testId)
-
-    -- Top face.
-    pos = torch.Tensor({ic, i1, ic})  -- Recall: 0-indexed.
-    if twoDim then
-      pos[3] = 0
-    end
-    Uy = tfluids.interpField(U[2], geom, pos)
-    mytester:assertlt(math.abs(Uy), 1e-5, 'Bad face velocity value ' .. testId)
-
-    if not twoDim then
-      -- Bottom face.
-      pos = torch.Tensor({ic, ic, i0})  -- Recall: 0-indexed.
-      local Uz = tfluids.interpField(U[3], geom, pos)
-      mytester:assertlt(math.abs(Uz), 1e-5,
-                        'Bad face velocity value ' .. testId)
-
-      -- Bottom face.
-      pos = torch.Tensor({ic, ic, i1})  -- Recall: 0-indexed.
-      Uz = tfluids.interpField(U[3], geom, pos)
-      mytester:assertlt(math.abs(Uz), 1e-5,
-                        'Bad face velocity value ' .. testId)
-    end
-
-    -- TODO(tompson): Is this enough test cases?
+    mytester:assertlt((dst - dstGT):abs():max(), precision, 'blur error')
   end
 end
 
-function test.setObstacleBcsCUDA()
-  -- TODO(tompson): Write a test of the forward function.
+function test.signedDistanceField()
+  for dim = 2, 3 do
+    local batchSize = torch.random(1, 5)
+    local widthIn = torch.random(16, 32)
+    local heightIn = torch.random(16, 32)
+    local depthIn = torch.random(16, 32)
+    local searchRad = torch.random(1, 5)
 
-  -- Test that the float and cuda implementations are the same.
-  local nchan = {2, 3}
-  local d = {1, torch.random(32, 64)}
-  local w = torch.random(32, 64)
-  local h = torch.random(32, 64)
-  local case = {'2D', '3D'}
+    if dim == 2 then
+      depthIn = 1
+    end
 
-  for testId = 1, 2 do
-    -- 2D and 3D cases.
-    local geom = torch.rand(d[testId], h, w):gt(0.8):float()
-    local U = torch.rand(nchan[testId], d[testId], h, w):float()
-    local UCPU = U:clone()
+    local flags = torch.rand(batchSize, 1, depthIn, heightIn, widthIn)
+    -- Turn it into a {0, TypeObstacle} grid.
+    flags = flags:gt(0.8):double():mul(tfluids.CellType.TypeObstacle)
+    local dist = flags:clone():uniform(0, 1)
+    local is3D = dim == 3
 
-    -- Perform the function on the CPU.
-    tfluids.setObstacleBcs(UCPU, geom)
+    tfluids.signedDistanceField(flags, searchRad, is3D, dist)
+  
+    -- Make sure the distances are correct.
+    -- This is a pretty dumb test. It's just a reimplementation of the same code
+    -- in lua.
+    local obs = tfluids.CellType.TypeObstacle
+    local distGT = dist:clone():uniform(0, 1)
+    for b = 1, flags:size(1) do
+      for z = 1, flags:size(3) do
+        for y = 1, flags:size(4) do
+          for x = 1, flags:size(5) do
+            if flags[{b, 1, z, y, x}] == obs then
+              distGT[{b, 1, z, y, x}] = 0
+            else
+              local distSq = searchRad * searchRad
+              local zStart = math.max(1, z - searchRad)
+              local zEnd = math.min(depthIn, z + searchRad)
+              local yStart = math.max(1, y - searchRad)
+              local yEnd = math.min(heightIn, y + searchRad)
+              local xStart = math.max(1, x - searchRad)
+              local xEnd = math.min(widthIn, x + searchRad)
+              for zoff = zStart, zEnd do
+                for yoff = yStart, yEnd do
+                  for xoff = xStart, xEnd do
+                    if flags[{b, 1, zoff, yoff, xoff}] == obs then
+                      curDistSq = ((z - zoff) * (z - zoff) +  
+                                   (y - yoff) * (y - yoff) +
+                                   (x - xoff) * (x - xoff))
+                      if curDistSq < distSq then
+                        distSq = curDistSq
+                      end
+                    end
+                  end
+                end
+              end
+              distGT[{b, 1, z, y, x}] = math.sqrt(distSq)
+            end
+          end
+        end
+      end
+    end
+    local err = dist - distGT
+    mytester:assertlt(err:abs():max(), precision, 'signedDistanceField error')
 
-    -- Perform the function on the GPU.
-    local UGPU = U:cuda()
-    tfluids.setObstacleBcs(UGPU, geom:cuda())
+    -- Now test another flags grid, with a known (and easy) solution.
+    -- Generate a bunch of single points in the flags grid.
+    flags:fill(tfluids.CellType.TypeFluid)
+    local npnts = 4
+    local pntPos = {}
+    for b = 1, batchSize do
+      pntPos[b] = {}
+      for i = 1, npnts do
+        local pos =  torch.Tensor({torch.random(1, widthIn),
+                                   torch.random(1, heightIn),
+                                   torch.random(1, depthIn)})
+        pntPos[b][i] = pos
+        flags[{b, 1, pos[3], pos[2], pos[1]}] = tfluids.CellType.TypeObstacle
+      end
+    end
+    -- Calculate what the GT output should be.
+    for b = 1, flags:size(1) do
+      for z = 1, flags:size(3) do
+        for y = 1, flags:size(4) do
+          for x = 1, flags:size(5) do
+            local dist = searchRad
+            for i = 1, npnts do
+              local delta = torch.Tensor({x, y, z}) - pntPos[b][i]
+              local cur_dist = delta:norm()
+              if cur_dist < dist then
+                dist = cur_dist
+              end
+            end
+            distGT[{b, 1, z, y, x}] = dist
+          end
+        end
+      end
+    end
+    -- Now test this against the tfluids function.
+    tfluids.signedDistanceField(flags, searchRad, is3D, dist)
+    err = dist - distGT
+    mytester:assertlt(err:abs():max(), precision, 'signedDistanceField error 2')
 
-    -- Compare the results.
-    local maxErr = (UCPU - UGPU:float()):abs():max()
-    mytester:assertlt(maxErr, precision,
-                      'setObstacleBcs CUDA ERROR ' .. case[testId])
-    
-    profileCuda(tfluids.setObstacleBcs, 'setObstacleBcs2D' .. case[testId],
-                {U, geom})
+    -- Now profile and test GPU version.
+    profileAndTestCuda(tfluids.signedDistanceField,
+                       'signedDistanceField dim ' .. dim,
+                       {flags, searchRad, is3D, dist}, {4})
   end
 end
 
 -- Now run the test above
 mytester:add(test)
 
-function tfluids.test(tests, seed, gpuDevice)
+function tfluids.test(tests, seed)
+  dofile('../lib/ls.lua')
+  dofile('../lib/load_manta_file.lua')  -- For torch.loadMantaFile()
+  dofile('../lib/modules/inject_tensor.lua')
+
   local curDevice = cutorch.getDevice()
-  -- By default don't test on the primary device.
   gpuDevice = gpuDevice or 1
   cutorch.setDevice(gpuDevice)
   print('Testing on gpu device ' .. gpuDevice)
@@ -611,25 +1103,30 @@ function tfluids.test(tests, seed, gpuDevice)
   print('Seed: ', seed)
   math.randomseed(seed)
   torch.manualSeed(seed)
-  cutorch.manualSeed(seed)
   mytester:run(tests)
 
-  print ''
-  print('-----------------------------------------------------------------' ..
-        '-------------')
-  print('| Module                                                       ' ..
-        '| Speedup     |')
-  print('-----------------------------------------------------------------' ..
-        '-------------')
-  for module, tm in pairs(times) do
-    local str = string.format('| %-60s | %6.2f      |', module,
-                              (tm.cpu / tm.gpu))
-    print(str)
+  numTimes = 0
+  for _, _ in pairs(times) do
+    numTimes = numTimes + 1
   end
-  print('-----------------------------------------------------------------' ..
-        '-------------')
 
-  cutorch.setDevice(curDevice)
+  if numTimes > 1 then
+    print ''
+    print('-----------------------------------------------------------------' ..
+          '-------------')
+    print('| Module - At resolution ' ..
+          string.format('%-4d', profileResolution) ..
+          '                                  | Speedup     |')
+    print('-----------------------------------------------------------------' ..
+          '-------------')
+    for module, tm in pairs(times) do
+      local str = string.format('| %-60s | %6.2f      |', module,
+                                (tm.cpu / tm.gpu))
+      print(str)
+    end
+    print('-----------------------------------------------------------------' ..
+          '-------------')
+  end
 
   return mytester
 end

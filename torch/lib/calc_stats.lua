@@ -36,8 +36,7 @@ function torch.calcStats(input)
   local batchCPU = data:AllocateBatchMemory(conf.batchSize)
   local batchGPU = torch.deepClone(batchCPU, 'torch.CudaTensor')
 
-  local matchManta = false
-  local divNet = nn.VelocityDivergence(matchManta):cuda()
+  local divNet = tfluids.VelocityDivergence():cuda()
 
   -- For each sample we'll save a histogram of 10,000 bins of varying scales.
   local nHistBins = 10000
@@ -86,9 +85,8 @@ function torch.calcStats(input)
     -- is not easy because the current parallel code doesn't guarantee batch
     -- order (might be OK, but it would be nice to know what err each sample
     -- has).
-    local perturbData = false
     data:CreateBatch(batchCPU, torch.IntTensor(imgList), conf.batchSize,
-                     perturbData, {}, mconf.netDownsample, conf.dataDir)
+                     conf.dataDir)
 
     -- We want to save the error distribution.
     torch.syncBatchToGPU(batchCPU, batchGPU)
@@ -96,10 +94,10 @@ function torch.calcStats(input)
     local target = torch.getModelTarget(batchGPU)
     local output = model:forward(input)
     local pPred, UPred = torch.parseModelOutput(output)
-    local pTarget, UTarget, geom = torch.parseModelTarget(target)
+    local pTarget, UTarget, flags = torch.parseModelTarget(target)
     local pErr = pPred - pTarget
     local UErr = UPred - UTarget
-    local div = divNet:forward({UPred, geom:select(2, 1)}) 
+    local div = divNet:forward({UPred, flags}) 
      
     -- Record UTarget, pTarget, pErr, UErr, div.
     -- We can't store ALL the dataset voxels in memory. So we need to create
@@ -135,7 +133,7 @@ function torch.calcStats(input)
 
     -- Now record divergence stability vs time.
     -- Restart the sim from the target frame.
-    local p, U, geom, density = tfluids.getPUGeomDensityReference(batchGPU)
+    local p, U, flags, density = tfluids.getPUFlagsDensityReference(batchGPU)
     U:copy(batchGPU.UTarget)
     p:copy(batchGPU.pTarget)
 
@@ -147,9 +145,9 @@ function torch.calcStats(input)
     for j = 2, nSteps do
       local outputDiv = false
       tfluids.simulate(conf, mconf, batchGPU, model, outputDiv)
-      local p, U, geom, density =
-          tfluids.getPUGeomDensityReference(batchGPU)
-      div = divNet:forward({U, geom})
+      local p, U, flags, density =
+          tfluids.getPUFlagsDensityReference(batchGPU)
+      div = divNet:forward({U, flags})
       for i = 1, #imgList do
         normDiv[{imgList[i], j}] = div[i]:norm()
       end

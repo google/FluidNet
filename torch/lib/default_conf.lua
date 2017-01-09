@@ -24,7 +24,7 @@ function torch.defaultConf()
   local conf = {
     batchSize = 16,  -- Definitely depends heavily on model and dataset
     dataDir = '../data/datasets/',  -- Where the unprocessed data is stored.
-    dataset = 'output_current_3d_model_sphere',  -- Default: 2D with geometry.
+    dataset = 'output_current_3d_model_sphere',  -- Default: 2D with obstacles.
     gpu = 1,  -- Cuda GPU to use
     ignoreFrames = 0,  -- Ignore the first 'n' frames of each run
     -- lrEpochMults: pairs of {epoch, multiplier}. We will
@@ -42,15 +42,16 @@ function torch.defaultConf()
       addBatchNorm = false,
       -- addPressureSkip: If true add a pressure skip connection.
       addPressureSkip = false,
-      -- advectionMethod: options are 'euler', 'rk2', 'maccormack'
-      advectionMethod = 'rk2',
+      -- advectionMethod: options are 'euler', 'maccormack'
+      advectionMethod = 'maccormack',
+      banksJoinStage = 3,  -- Join BEFORE this stage.
+      banksAggregateMethod = 'concat',  -- options are 'concat' and 'add'
+      banksNum = 1,  -- Number of parallel resolution banks (1 == disable).
+      banksSplitStage = 1,  -- Split BEFORE this stage.
+      banksWeightShare = false,
       batchNormAffine = true,  -- ignored if addBatchNorm == false.
       batchNormEps = 1e-4,  -- ignored if addBatchNorm == false.
       batchNormMom = 0.1,  -- ignored if addBatchNorm == false.
-      -- bndType: Defines the set boundary type method when updating velocity
-      -- field (done after almost every step in the simulator). Options are:
-      -- 'Ave', 'None', 'Zero'.
-      bndType = 'Ave',
       -- buoyancyScale: Buoyancy force scale. Set to 0 to disable. 
       buoyancyScale = 0,
       -- dt: default simulation timestep. We will check this against manta
@@ -64,12 +65,13 @@ function torch.defaultConf()
       -- network.
       inputChannels = {
         div = true,
-        geom = true,
+        flags = true,
         pDiv = true,
         UDiv = false,
       },
       lossFunc = 'fluid',  -- Only fluid is supported for now.
-      lossFuncScaleInvariant = false,  -- If true then use Eigen's scale inv MSE
+      lossFuncBorderWeight = 1,  -- 1 == disabled.
+      lossFuncBorderWidth = 3,  -- We linearly ramp from 1 to weight.
       lossPLambda = 0,
       lossULambda = 0,
       lossDivLambda = 1,
@@ -88,10 +90,14 @@ function torch.defaultConf()
       -- 'lbfgs' (requires full batch not mini batches)
       modelType = 'default',  -- Choices are 'default', 'yang', 'tog'
       nonlinType = 'relu',  -- Choices are: 'relu', 'relu6', 'sigmoid'.
+      normalizeInput = true,  -- If true, normalize by max(std(chan), thresh)
+      normalizeInputChan = 'UDiv',  -- Which input channel to calculate std.
+      normalizeInputFunc = 'std',  -- Choices are: 'std' or 'norm' (l2).
+      normalizeInputThreshold = 0.00001,  -- Don't normalize input noise.
       optimizationMethod = 'adam',
       optimState = {
         bestPerf = math.huge,
-        learningRate = 0.00025,
+        learningRate = 0.0025,
         weightDecay = 0,  -- L2 regularization parameter
         momentum = 0.9,
         dampening = 0,
@@ -102,27 +108,21 @@ function torch.defaultConf()
         beta2 = 0.999,  -- beta2 value for ADAM optimizer.
       },
       poolType = 'avg', -- avg or max.
+      -- simMethod: At inference time (or even during training
+      -- 'tfluids.simulate' calls for the future frame divergence inputs) we
+      -- can choose to use a different simulator (other than convnet). This
+      -- allows comparisons with our 'jacobi' or 'pcg' baseline methods. Use
+      -- 'convnet' to simluate using our method.
+      simMethod = 'convnet',  -- At inference time (during simulate) we ca
+      timeScaleSigma = 1,  -- Amplitude of time scale perturb during training.
       -- vorticityConfinementAmp: The vorticity confinement scale value.
       -- Set to 0 to disable vorticity confinement.
-      vorticityConfinementAmp = 0.05,
+      vorticityConfinementAmp = 0.0,
     },
     numDataThreads = 8,  -- To amortize the cost of data loading / processing.
-    profile = false,  -- Requires ProFi.
-    profileFPROPTime = 0,  -- In sec. Set to zero to disable profiling.
+    profile = true,  -- If true then profile the model at startup.
     resumeTraining = false,
     train = true,  -- perform training (otherwise just evaluate)
-    trainPerturb = {
-      flipProb = 0.5,
-      on = false,  -- Whether or not to preturb training data.
-      rotation = 0,  -- In degrees. NOT SUPPORTED.
-      scale = 0,  -- Percentage. NOT SUPPORTED.
-      -- timeScaleSigma: controls artificial dt inflation when calculating long
-      -- term divergence. Must be >= 0 (set to 0 to disable).
-      -- The random dt will be 'dt * (1 + abs(randn(0, timeScaleSigma)))' (i.e.
-      -- we mostly pick scales that are close to dt.
-      timeScaleSigma = 1,
-      transPix = 0,  -- NOT SUPPORTED.
-    },
   }
   return conf
 end
