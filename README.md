@@ -24,6 +24,13 @@ Note: This is not an official Google product.
 UPDATES / NEWS:
 ---------------
 
+**Feb 6 2017**
+- Huge refactoring and bug-fix update (too many to mention here!).
+- Switched data everywhere to MAC-Grid (instead of central sampling).
+- Numerous improvements to Convnet model (some departure from arxiv paper, paper revision coming in Feburary/March).
+- ```tfluids``` now has a ```third_party``` sub-library. This is essentially a port of some of Manta's simulator code (to torch + CUDA). Note that it is released under the GNU GPL V3 license (as per Manta's licensing).
+- GPU PCG (using NVidia's cusparse library) and Jacobi methods added as baseline methods.
+
 **Jan 6 2017**
 - Lots of updates to model and training code.
 - Added model of Yang et al. "Data-driven projection method in fluid simulation" as a baseline comparison.
