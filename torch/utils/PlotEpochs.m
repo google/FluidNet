@@ -13,59 +13,65 @@
 % limitations under the License.
 
 % @param path - optional path for model data.
-function [] = PlotEpochs(path)
+% @param path - optional cell of filenames to plot.
+function [] = PlotEpochs(models)
 % A simple utility to plot the per-epoch performance of a bunch of
 % models (so you can compare learning rates, hyperparams, etc). This is
 % very hacky.
 
 global prev_models;
-clc;
 
 % Less permissive selection:
 if nargin < 1
-  path = '../../data/models';
-end
+  clc;
+  
+  % User will select models.
+  path = '../../data/models/2017_01_26/';
 
-files = dir([path, '/*_log.txt']);
-files = {files.name};
-assert(length(files) > 0, 'No models to plot!');
-files = sort(files);
-ok_files = files;
+  files = dir([path, '/*_log.txt']);
+  files = {files.name};
+  assert(length(files) > 0, 'No models to plot!');
+  files = sort(files);
+  ok_files = files;
 
-[s, ok] = listdlg('PromptString', ...
-  'Select all log files to plot ("cancel" = plot the old set)',...
-  'SelectionMode', 'multiple', 'ListString', ok_files, ...
-  'ListSize', [1200, 800]);
+  [s, ok] = listdlg('PromptString', ...
+    'Select all log files to plot ("cancel" = plot the old set)',...
+    'SelectionMode', 'multiple', 'ListString', ok_files, ...
+    'ListSize', [1200, 800]);
 
-if ~ok
-  models = prev_models;
-  if isempty(models)
-    error('No previous models to print');
+  if ~ok
+    models = prev_models;
+    if isempty(models)
+      error('No previous models to print');
+    end
+  else
+    models = cell(1, length(s));
+    for i = 1:length(s)
+      models{i} = ok_files{s(i)};
+    end
+    prev_models = models;
+  end
+
+  if ~iscell(models)
+    models = {models};
+  end
+  
+  for i = 1:length(models)
+    models{i} = [path, '/', models{i}];
   end
 else
-  models = cell(1, length(s));
-  for i = 1:length(s)
-    models{i} = ok_files{s(i)};
-  end
-  prev_models = models;
-end
-
-if ~iscell(models)
-  models = {models};
+  assert(iscell(models));
 end
 
 disp('Found model files:');
 disp(models);
-disp('In path:');
-disp(path);
-disp(' ');
 
 handles = cell(1,6);
-Plot(path, models, handles);
+Plot(models, handles);
 
 end
 
-function [] = Plot(path, models, handles)
+function [] = Plot(models, handles)
 data = cell(1, length(models));
 
 % Get the results.
@@ -73,7 +79,7 @@ for i = 1:length(models)
   cur_model = models{i};
   
   disp(['Processing ', cur_model]);
-  cur_data = readtable([path, '/', cur_model], 'Delimiter', '\t');
+  cur_data = readtable( cur_model, 'Delimiter', '\t');
   cur_data = cur_data(:, 1:end-1);
   data{i} = cur_data;
   
@@ -134,7 +140,7 @@ assert(length(indices) > 0);
 legend_str = {};
 legend_handles = [];
 
-smoothing_window = 10;
+smoothing_window = 16;
 raw_thickness = 1.5;
 raw_alpha = 0.1;
 smooth_thickness = 2;
@@ -206,8 +212,11 @@ for i = 1:length(models)
     xend = max(xend, x(end));
     ystart = min(ystart, min(y));
     yend = max(yend, y(1));
+    
+    % For the legend we don't want the full path.
+    str_decomp = strsplit(model_str, '/');
     legend_str{length(legend_str) + 1} = ...
-      [header{indices(j)}, ': ', model_str];
+      [header{indices(j)}, ': ', str_decomp{end}];
     legend_handles(length(legend_handles) + 1) = lsmooth;
     if (best_model_val(j) > min(y))
       best_model_val(j) = min(y);
@@ -223,7 +232,7 @@ for j = 1:length(indices)
 end
 grid on;
 legend(legend_handles, legend_str, 'Location', 'NorthEast', 'FontSize', ...
-  6, 'Interpreter', 'none');    
+  8, 'Interpreter', 'none');    
 xlabel(xlabel_str, 'FontSize', 14);
 ylabel(ylabel_str, 'FontSize', 14);
 end

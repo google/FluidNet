@@ -34,7 +34,7 @@ end
 
 function WeightedFlatMSECriterion:updateOutput(input, target, weight)
   assert(input:isSameSizeAs(target), 'input and target size mismatch')
-  assert(input:isSameSizeAs(weight), 'input and target size mismatch')
+  assert(input:isSameSizeAs(weight), 'input and weight size mismatch')
   self._inputBuffer:resizeAs(input)
   self._targetBuffer:resizeAs(target)
   self._inputBuffer:copy(input):cmul(weight)

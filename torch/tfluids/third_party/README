@@ -1,0 +1,12 @@
+The code in this third_party directory is released under the GNU GPL V3 license
+outlined in FluidNet/torch/tfluids/third_party/LICENSE.
+
+We have used as reference, code from Mantaflow (http://mantaflow.com/) to
+implement a number of functions in tfluids. Some of these functions are a
+direct port to torch / cuda of the original source, and some are just loosely
+based on the Manta version. In any case, any derivative works of Manta flow
+is released as part of this third_party package under Manta's GNU GPL V3
+license. For any attempt to redistribute this code, or for any uses not covered
+by thethe GNU GPL V3 license, use you should contact the original authors of
+Mantaflow (Tobias Pfaff and Nils Thuerey) for more information.
+

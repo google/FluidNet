@@ -108,4 +108,4 @@ end
 
 -- Now run the test above
 mytester:add(tests)
-mytester:run()  -- TEMP CODE
+mytester:run()

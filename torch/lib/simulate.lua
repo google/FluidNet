@@ -22,34 +22,31 @@
 
 local tfluids = require('tfluids')
 
-function tfluids.getPUGeomDensityReference(batchData)
-  local p = batchData.pDiv[{{}, 1}]  -- Remove the unary dimension.
+function tfluids.getPUFlagsDensityReference(batchData)
+  local p = batchData.pDiv
   local U = batchData.UDiv
-  local geom = batchData.geom[{{}, 1}]  -- Remove the unary dimension.
+  local flags = batchData.flags
   local density = batchData.density  -- Optional field.
-  return p, U, geom, density
+  return p, U, flags, density
 end
 
 function tfluids.removeBCs(batch)
   batch.pBC = nil
   batch.pBCInvMask = nil
-  batch.geomBC = nil
-  batch.geomBCInvMask = nil
   batch.UBC = nil
   batch.UBCInvMask = nil
   batch.densityBC = nil
   batch.densityBCInvMask = nil
+  collectgarbage()
 end
 
--- @param densityVal: table of scalar values of size density:size(2) (i.e. the
--- color to set the density field).
+--- @param densityVal: table of scalar values of size #density (i.e. the
+--- color to set the density field). (if greyscale set to '{value}')
 -- @param uScale: scalar value which sets the size of the velocity.
 -- @param rad: fraction of xdim.
 function tfluids.createPlumeBCs(batch, densityVal, uScale, rad)
   batch.pBC = nil  -- Nothing to do for pressure.
   batch.pBCInvMask = nil
-  batch.geomBC = nil  -- Nothing to do for geometry.
-  batch.geomBCInvMask = nil
 
   -- We'll set U = (0, 1, 0) in a circle on the bottom border and
   -- p = 1 in the circle.
@@ -57,16 +54,30 @@ function tfluids.createPlumeBCs(batch, densityVal, uScale, rad)
   batch.UBCInvMask = batch.UBC:clone():fill(1)
   assert(batch.density ~= nil,
          'plume BCs require a density field to be specified')
-  batch.densityBC = batch.density:clone():fill(0)
-  batch.densityBCInvMask = batch.density:clone():fill(1)
+  assert(torch.type(densityVal) == 'table')
+  if torch.isTensor(batch.density) then
+    batch.densityBC = batch.density:clone():fill(0)
+    batch.densityBCInvMask = batch.density:clone():fill(1)
+    assert(#densityVal == 1, 'there should be a single density value')
+  else
+    assert(torch.type(batch.density) == 'table',
+           'density should be either a table or tensor.')
+    batch.densityBC = {}
+    batch.densityBCInvMask = {}
+    assert(#densityVal == #batch.density, 'Need a density val per channel')
+    for i = 1, #batch.density do
+      batch.densityBC[i] = batch.density[i]:clone():fill(0)
+      batch.densityBCInvMask[i] = batch.density[i]:clone():fill(1)
+    end
+  end
 
   assert(batch.UBC:dim() == 5)
   assert(batch.UBC:size(1) == 1, 'Only single batch allowed.')
   local xdim = batch.UBC:size(5)
   local ydim = batch.UBC:size(4)
   local zdim = batch.UBC:size(3)
-  local twoDim = batch.UBC:size(2) == 2
-  if not twoDim then
+  local is3D = batch.UBC:size(2) == 3
+  if is3D then
     assert(batch.UBC:size(2) == 3)
   else
     assert(zdim == 1)
@@ -76,15 +87,12 @@ function tfluids.createPlumeBCs(batch, densityVal, uScale, rad)
   local plumeRad = math.floor(xdim * rad)
   local y = 1
   local vec
-  if twoDim then
+  if not is3D then
     vec = torch.Tensor({0, 1}):typeAs(batch.UBC)
   else
     vec = torch.Tensor({0, 1, 0}):typeAs(batch.UBC)
   end
   vec:mul(uScale)
-  densityVal = torch.Tensor(densityVal):typeAs(batch.densityBC)
-  assert(densityVal:size(1) == batch.densityBC:size(2),
-         'Incorrect density specifier length')
   for z = 1, zdim do
     for y = 1, 4 do
       for x = 1, xdim do
@@ -94,8 +102,15 @@ function tfluids.createPlumeBCs(batch, densityVal, uScale, rad)
           -- In the plume. Set the BCs.
           batch.UBC[{1, {}, z, y, x}]:copy(vec)
           batch.UBCInvMask[{1, {}, z, y, x}]:fill(0)
-          batch.densityBC[{1, {}, z, y, x}]:copy(densityVal)
-          batch.densityBCInvMask[{1, {}, z, y, x}]:fill(0)
+          if torch.isTensor(batch.density) then
+            batch.densityBC[{1, {}, z, y, x}]:fill(densityVal[1])
+            batch.densityBCInvMask[{1, {}, z, y, x}]:fill(0)
+          else
+            for i = 1, #batch.density do
+              batch.densityBC[i][{1, {}, z, y, x}]:fill(densityVal[i])
+              batch.densityBCInvMask[i][{1, {}, z, y, x}]:fill(0)
+            end
+          end
         else
           -- Outside the plume explicitly set the velocity to zero and leave
           -- the density alone.
@@ -107,59 +122,16 @@ function tfluids.createPlumeBCs(batch, densityVal, uScale, rad)
   end
 end
 
-local function setBoundaryConditionsAverage(p, U, geom, density)
-  -- This is NOT physically plausible, but helps with divergence blowup on
-  -- the boundaries. The boundaries will all receive the local average.
-  tfluids._UAve = tfluids._UAve or torch.Tensor():typeAs(U)
-  tfluids._UAve:resizeAs(U):copy(U)
-  tfluids.averageBorderCells(U, geom, tfluids._UAve)
-  -- Copy the results back.
-  U:copy(tfluids._UAve)
-end
-
-local function setBoundaryConditionsZero(p, U, geom, density)
-  assert(U:dim() == 4)
-  local twoDim = U:size(1) == 2
-  -- TODO(kris): Only zero velocities exiting boundaries.
-  if not twoDim then
-    U[{{}, {1}, {}, {}}]:zero()
-    U[{{}, {-1}, {}, {}}]:zero()
-  end
-  U[{{}, {}, {1}, {}}]:zero()
-  U[{{}, {}, {-1}, {}}]:zero()
-  U[{{}, {}, {}, {1}}]:zero()
-  U[{{}, {}, {}, {-1}}]:zero()
-end
-
-local function setBoundaryConditionsBatch(batch, bndType)
-  if bndType == 'None' then
-    return
-  end
-  local p, U, geom, density = tfluids.getPUGeomDensityReference(batch)
-
-  for b = 1, U:size(1) do
-    local curP = p[b]
-    local curU = U[b]
-    local curGeom = geom[b]
-    local curDensity
-    if density ~= nil then
-      curDensity = density[b]
-    end
-    bndType = bndType or 'Zero'
-    if bndType == 'Zero' then
-      setBoundaryConditionsZero(curP, curU, curGeom, curDensity)
-    elseif bndType == 'Ave' then
-      setBoundaryConditionsAverage(curP, curU, curGeom, curDensity)
-    else
-      error('Bad bndType value: ' .. bndType)
-    end
-    tfluids.setObstacleBcs(curU, curGeom)
-  end
-
+-- We have some somewhat hacky boundary conditions, where we freeze certain
+-- values on every iteration of the solver. It is equivalent to setting internal
+-- fluid cells to not receive updates during the pressure projection. Note that
+-- it might actually result in divergence that is never corrected (although
+-- this is usually what we use it for).
+local function setConstVals(batch, p, U, flags, density)
   -- Apply the external BCs.
   -- TODO(tompson): We have a separate "mask" tensor for every boundary
   -- condition type. These should really be an bit enum to specify which
-  -- conditions are being set (i.e. 0x0110 would be specify U and geom only).
+  -- conditions are being set (i.e. 0x0110 would be specify U and flags only).
   -- But torch doesn't support bitwise operations natively.
   if batch.pBC ~= nil or batch.pBCInvMask ~= nil then
     -- Zero out the p values on the BCs.
@@ -171,113 +143,28 @@ local function setBoundaryConditionsBatch(batch, bndType)
     U:cmul(batch.UBCInvMask)
     U:add(batch.UBC)
   end
-  if batch.geomBC ~= nil or batch.geomBCInvMask ~= nil then
-    -- Not sure why we would ever need this, but leave it in there for future
-    -- (unforeseen) use cases.
-    geom:cmul(batch.geomBCInvMask)
-    geom:add(batch.geomBC)
-  end
   if batch.densityBC ~= nil or batch.densityBCInvMask ~= nil then
-    density:cmul(batch.densityBCInvMask)
-    density:add(batch.densityBC)
-  end
-end
-
-local function advectScalarBatch(dt, scalar, U, geom, advectionMethod)
-  -- Allocate a temporary output (because we cannot advect in place).
-  tfluids._scalarAdv = tfluids._scalarAdv or torch.Tensor():typeAs(U)
-  tfluids._scalarAdv:resizeAs(scalar[{1, 1}])
-
-  for b = 1, scalar:size(1) do
-    for c = 1, scalar:size(2) do
-      -- Independently advect each channel.
-      tfluids.advectScalar(dt, scalar[{b, c}], U[b], geom[b],
-                           tfluids._scalarAdv, advectionMethod)
-      scalar[{b, c}]:copy(tfluids._scalarAdv)
-    end
-  end
-
-end
-
-local function advectVelocityBatch(dt, U, geom, advectionMethod)
-  -- Allocate a temporary output (because we cannot advect in place).
-  tfluids._UAdv = tfluids._UAdv or torch.Tensor():typeAs(U)
-  tfluids._UAdv:resizeAs(U[1])
-
-  for b = 1, U:size(1) do
-    tfluids.advectVel(dt, U[b], geom[b], tfluids._UAdv, advectionMethod)
-    U[b]:copy(tfluids._UAdv)
-  end
-end
-
-local function vorticityConfinementBatch(dt, scale, U, geom)
-  assert(U:dim() == 5 and geom:dim() == 4)
-  -- vorticityConfinement needs scratch space to store the curl and ||curl||.
-  if tfluids._curl == nil or torch.type(tfluids._curl) ~= torch.type(U) then
-    tfluids._curl = U:clone()
-  end
-  if U:size(2) == 2 then
-    tfluids._curl:resizeAs(geom[1])  -- 2D curl is a scalar field.
-  else
-    tfluids._curl:resizeAs(U[1])
-  end
-  if tfluids._magCurl == nil or
-      torch.type(tfluids._magCurl) ~= torch.type(geom) then
-    tfluids._magCurl = geom:clone()
-  end
-  tfluids._magCurl:resizeAs(geom[1])
-
-  for b = 1, U:size(1) do
-    tfluids.vorticityConfinement(dt, scale, U[b], geom[b], tfluids._curl,
-                                 tfluids._magCurl)
-  end
-end
-
--- NOTE: this function is buoyancy for GASSES. It does not model buoyancy of
--- fluid / air interactions.
-function tfluids.buoyancyBatch(dt, scalar, U, geom, scale)
-  -- NEW BUOYANCY CODE THAT MATCHES MANTA, note that it's not really correct.
-  -- i.e. it doesn't really follow the buoyancy calc in Bridson, but I
-  -- understand how they get there.
-  -- This also matches the OLD buoyancy code (algebraically), but is
-  -- significantly simpler.
-  assert(U:dim() == 5 and geom:dim() == 4)
-  assert(scalar:dim() == 5)
-
-  tfluids._fbuoy = tfluids._fbuoy or torch.Tensor():typeAs(scalar)
-  tfluids._T = tfluids._T or torch.FloatTensor():typeAs(scalar)
-  tfluids._invGeom = tfluids._invGeom or torch.FloatTensor():typeAs(scalar)
-  
-  -- coeff: Takes into account gravity. It is derived from the effective scale
-  -- of the old code, normalized by dt = 0.4.
-  local coeff = 0.5470
-  
-  for b = 1, U:size(1) do
-    tfluids._T:resizeAs(scalar[b][1])
-    if scalar:size(2) == 1 then
-      tfluids._T:copy(scalar[b][1])  -- temperature IS the scalar value.
+    assert(torch.type(density) == torch.type(batch.densityBC))
+    if torch.isTensor(density) then
+      density:cmul(batch.densityBCInvMask)
+      density:add(batch.densityBC)
     else
-      torch.mean(tfluids._T, scalar[b], 1)  -- temperature is the mean.
+      assert(torch.type(batch.density) == 'table')
+      assert(#density == #batch.densityBC)
+      for i = 1, #density do
+        density[i]:cmul(batch.densityBCInvMask[i])
+        density[i]:add(batch.densityBC[i])
+      end
     end
-    
-    tfluids._invGeom:resizeAs(geom[b])
-    tfluids._invGeom:copy(geom[b]):mul(-1):add(1)
-    tfluids._T:cmul(tfluids._invGeom)
-
-    -- From Bridson page 102: 
-    --   --> Fbuoy / -g = coeffA * s + -coeffB * (T - Tamb)
-    -- If we set Tamb to zero and assume s = T then we just get a simple scalar
-    -- of the temperature pointing up (because it's negative of gravity).
-    tfluids._fbuoy:resizeAs(tfluids._T)
-    tfluids._fbuoy:zero()
-    tfluids._fbuoy:add(coeff * dt * scale, tfluids._T)
-    tfluids._fbuoy:cmul(tfluids._invGeom)  -- Redundant, but keep for clarity.
-
-    -- Finally apply to the y-component of velocity. 
-    U[{b, 2}]:add(tfluids._fbuoy)
   end
 end
 
+-- The top level simulation loop.
+--
+-- Note that this should follow the same function calls as are in
+-- manta/scenes/_trainingData.py, with one exception. The setWallBcs call before
+-- and after the pressure solve are performed in our model.
+--
 -- @param conf: config table.
 -- @param mconf: model config table.
 -- @param batch: CPU or GPU batch data (holds simulation state before and after
@@ -290,30 +177,44 @@ function tfluids.simulate(conf, mconf, batch, model, outputDiv)
     outputDiv = false
   end
 
-  local p, U, geom, density = tfluids.getPUGeomDensityReference(batch)
+  local p, U, flags, density = tfluids.getPUFlagsDensityReference(batch)
 
   -- First advect all scalar fields (density, temperature, etc).
   if density ~= nil then
-    advectScalarBatch(mconf.dt, density, U, geom, mconf.advectionMethod)
+    if type(density) == 'table' then
+      -- Density is multi-channel, i.e. for RGB densities in the 2D demo.
+      for _, chan in pairs(density) do
+        tfluids.advectScalar(mconf.dt, chan, U, flags, mconf.advectionMethod)
+      end
+    else
+      tfluids.advectScalar(mconf.dt, density, U, flags, mconf.advectionMethod)
+    end
   end
 
   -- Now self-advect velocity (must be advected last).
-  advectVelocityBatch(mconf.dt, U, geom, mconf.advectionMethod)
-  setBoundaryConditionsBatch(batch, mconf.bndType)
+  tfluids.advectVel(mconf.dt, U, flags, mconf.advectionMethod)
+
+  -- Set the manual boundary conditions.
+  setConstVals(batch, p, U, flags, density)
 
   -- Add external forces (buoyancy and gravity).
   if density ~= nil and mconf.buoyancyScale > 0 then
-    tfluids.buoyancyBatch(mconf.dt, density, U, geom, mconf.buoyancyScale)
-    setBoundaryConditionsBatch(batch, mconf.bndType)
+    local gravity = U:new():resize(3)
+    gravity[2] = (-tfluids.getDx(flags) / 4) * mconf.buoyancyScale
+    if type(density) == 'table' then
+      -- Just use the first channel (TODO(tompson): average the channels)
+      tfluids.addBuoyancy(U, flags, density[1], gravity, mconf.dt)
+    else
+      tfluids.addBuoyancy(U, flags, density, gravity, mconf.dt)
+    end
   end
 
-  -- TODO(tompson,kris): Add support for gravity (easy to do, just add (-dt) * g
-  -- to the velocity field y component).
+  -- TODO(tompson): Add support for gravity.
 
   -- Add vorticity confinement.
   if mconf.vorticityConfinementAmp > 0 then
-    vorticityConfinementBatch(mconf.dt, mconf.vorticityConfinementAmp, U, geom)
-    setBoundaryConditionsBatch(batch, mconf.bndType)
+    local amp = tfluids.getDx(flags) * mconf.vorticityConfinementAmp
+    tfluids.vorticityConfinement(U, flags, mconf.vorticityConfinementAmp)
   end
 
   if outputDiv then
@@ -322,18 +223,52 @@ function tfluids.simulate(conf, mconf, batch, model, outputDiv)
     return
   end
 
-  -- FPROP the model to perform the pressure projection & velocity calculation.
-  local modelOutput = model:forward(torch.getModelInput(batch))
+  -- Set the constant domain values.
+  setConstVals(batch, p, U, flags, density)
 
-  -- Copy the final p and U back to the state tensor.
-  local pPred, UPred = torch.parseModelOutput(modelOutput)
-  p:copy(pPred)
-  U:copy(UPred)
+  if mconf.simMethod == nil or mconf.simMethod == 'convnet' then
+    -- FPROP the model to perform the pressure projection & velocity
+    -- calculation.
+    -- NOTE: setWallBcs is performed BEFORE AND AFTER the pressure projection.
+    -- So there's no need to call it again.
+    local modelOutput = model:forward(torch.getModelInput(batch))
+  
+    -- Copy the final p and U back to the state tensor.
+    local pPred, UPred = torch.parseModelOutput(modelOutput)
+    p:copy(pPred)
+    U:copy(UPred)
+  else
+    -- Calculate the RHS of the linear system (divergence).
+    batch.div = batch.div or p:clone()
+    batch.div:typeAs(U):resizeAs(p)
+    tfluids.velocityDivergenceForward(U, flags, batch.div)
 
-  setBoundaryConditionsBatch(batch, mconf.bndType)
+    -- Solve for pressure.
+    local residual
+    if mconf.simMethod == 'pcg' then
+      local tol = 1e-4
+      local maxIter = 100
+      local precondType = 'ic0'  -- options: 'ic0', 'none', 'ilu0'
+      residual = tfluids.solveLinearSystemPCG(
+          p, flags, batch.div, mconf.is3D, tol, maxIter, precondType)
+    elseif mconf.simMethod == 'jacobi' then
+      local pTol = 0  -- Essentially, this means a fixed number of iter.
+      local maxIter = 100  -- It has VERY slow convergence. Run for long time.
+      residual = tfluids.solveLinearSystemJacobi(
+          p, flags, batch.div, mconf.is3D, pTol, maxIter)
+    else
+      error('mconf.simMethod (' .. mconf.simMethod .. ') is not a valid option')
+    end
+
+    -- Now update velocity (using the pressure gradient).
+    tfluids.velocityUpdateForward(U, flags, p)
+  end
+
+  -- Set the constant domain values.
+  setConstVals(batch, p, U, flags, density)
 
   -- Finally, clamp the velocity so that even if the sim blows up it wont blow
-  -- up to inf (which causes some of our kernels to hang infinitely).
-  -- (if the velocity is this big we have other problems other than truncation).
+  -- up to inf. If the velocity is this big we have other problems other than
+  -- amplitude truncation).
   U:clamp(-1e6, 1e6)
 end

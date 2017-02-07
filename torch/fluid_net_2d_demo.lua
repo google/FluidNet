@@ -20,15 +20,7 @@ local glu = require('libLuaGlu')
 local glut = require('libLuaGlut')
 local tfluids = require('tfluids')
 dofile("lib/include.lua")
-dofile("lib/demo_utils.lua")
 local emitter = dofile("lib/emitter.lua")
-
--- You can install the profiler using: 'luarocks install ProFi'
-local ProFi = torch.loadPackageSafe('ProFi')
-local profile = false
-if ProFi ~= nil and profile then
-  ProFi:start()
-end
 
 -- ****************************** Define Config ********************************
 local conf = torch.defaultConf()
@@ -44,6 +36,7 @@ print("GPU That will be used (id = " .. conf.gpu .. "):")
 print(cutorch.getDeviceProperties(conf.gpu))
 
 -- **************************** Load data from Disk ****************************
+-- We use this in the visualization demo to seed the velocity and flag fields.
 local tr = torch.loadSet(conf, 'tr') -- Instance of DataBinary.
 local te = torch.loadSet(conf, 'te') -- Instance of DataBinary.
 
@@ -53,18 +46,16 @@ local mconf, model = torch.loadModel(conf.modelDirname)
 model:cuda()
 print('==> Loaded model from: ' .. conf.modelDirname)
 torch.setDropoutTrain(model, false)
-assert(mconf.twoDim == tr.twoDim, 'Model data dimension mismatch')
-
--- Remove buoyancy for this demo (can be toggled on later).
-mconf.buoyancyScale = 0
+assert(mconf.is3D == tr.is3D, 'Model data dimension mismatch')
 
 -- *************************** Define some variables ***************************
 -- These variables are global at FILE scope only.
+local upscale = 1.5  -- How much to upscale from the dataset.
 local batchCPU, batchGPU
 local mouseDown = {false, false}  -- {left, right}
 local mouseDragging = {false, false}
 local mouseLastPos = emitter.vec3.create(0, 0, 0)
-local mouseInputRadiusInGridCells = 3
+local mouseInputRadiusInGridCells = 5 * upscale
 local mouseInputAmplitude = 20
 local mouseInputSphere = emitter.Sphere.create(emitter.vec3.create(0, 0, 0),
                                                mouseInputRadiusInGridCells)
@@ -77,7 +68,7 @@ local im = torch.FloatTensor()  -- Temporary render buffer.
 local renderVelocity = true
 local renderPressure = false
 local renderDivergence = false
-local renderGeometry = true
+local renderObstacles = true
 local texGLIDs = {}
 local windowResolutionX = 1024
 local windowResolutionY = 1024
@@ -96,12 +87,28 @@ function tfluids.loadData()
   local imgList = {torch.random(1, tr:nsamples())}
   print('Using image: ' .. imgList[1])
   batchCPU = tr:AllocateBatchMemory(conf.batchSize)
+  tr:CreateBatch(batchCPU, torch.IntTensor(imgList), conf.batchSize,
+                 conf.dataDir)
+
+  -- Upscale the data. TODO(tompson): Handle upscaling flags properly)
+  for key, value in pairs(batchCPU) do
+    if torch.isTensor(value) then
+      assert(value:size(1) == 1 and value:size(3) == 1)  -- Should be bs=1, 2D
+      value = value:resize(value:size(2), value:size(4), value:size(5))
+      local up = value:clone():resize(value:size(1), value:size(2) * upscale,
+                                      value:size(3) * upscale)
+      for i = 1, value:size(1) do
+        image.scale(up[i], value[i])
+      end
+      batchCPU[key] = up:resize(conf.batchSize, up:size(1), 1, up:size(2),
+                                up:size(3))
+    end
+  end
+
+  batchCPU.flags = batchCPU.flags:round()
+
   batchGPU = torch.deepClone(batchCPU, 'torch.CudaTensor')
-  local perturb = false
-  tr:CreateBatch(batchCPU, torch.IntTensor(imgList), conf.batchSize, perturb,
-                 {}, mconf.netDownsample, conf.dataDir)
-  torch.syncBatchToGPU(batchCPU, batchGPU)
-  assert(tr.twoDim, 'Density needs updating to 3D')
+  assert(not tr.is3D, 'Density needs updating to 3D')
   -- Pick a new density each time.
   densityType = math.fmod(densityType + 1, 5)
   local im
@@ -125,23 +132,39 @@ function tfluids.loadData()
     im = image.vflip(im)
   end
 
-  local density = image.scale(im, tr.xdim, tr.ydim)
-  -- All values (U, p, geom, etc) need to have a batch dimension and a unary
+  local h = batchCPU.flags:size(4)
+  local w = batchCPU.flags:size(5)
+  local density = image.scale(im, h, w)
+  -- All values (U, p, flags, etc) need to have a batch dimension and a unary
   -- depth dimension.
-  density = density:resize(1, density:size(1), 1, density:size(2),
-                           density:size(3))
+  density = density:resize(1, density:size(1), 1, h, w)
 
-  batchCPU.density = density
-  batchGPU.density = density:cuda()
+  -- We actually need either a scalar density or a table of densities.
+  batchCPU.density = {}
+  batchGPU.density = {}
+  for i = 1, 3 do
+    batchCPU.density[i] = density[{{}, {i}, {}, {}, {}}]:contiguous()
+    batchGPU.density[i] = batchCPU.density[i]:cuda()
+  end
 
-  local _, UGPU, geomGPU = tfluids.getPUGeomDensityReference(batchGPU)
+  local _, UGPU, flagsGPU = tfluids.getPUFlagsDensityReference(batchGPU)
 end
+
+local densityToRGBNet = nn.JoinTable(2):cuda()
+local divergenceNet = tfluids.VelocityDivergence():cuda()
+local flagsToOccupancyNet = tfluids.FlagsToOccupancy():cuda()
+
+-- Remove buoyancy for this demo (can be toggled on later).
+mconf.buoyancyScale = 0
+mconf.vorticityConfinementAmp = 0
+mconf.dt = 4 / 60
+mconf.simMethod = 'convnet'
 
 -- ******************************** OpenGL Funcs *******************************
 local function convertMousePosToGrid(x, y)
-  local xdim = tr.xdim
-  local ydim = tr.ydim
-  local zdim = tr.zdim
+  local xdim = batchCPU.flags:size(5)
+  local ydim = batchCPU.flags:size(4)
+  local zdim = 1
   local gridX = x / windowResolutionX
   local gridY = y / windowResolutionY
   local gridZ = 1
@@ -176,10 +199,6 @@ end
 
 function tfluids.keyboardFunc(key, x, y)
   if key == 27 then  -- ESC key.
-    if ProFi ~= nil and profile then
-      ProFi:stop()
-      ProFi:writeReport('/tmp/demo_fluid_net_profiler_report.txt')
-    end
     os.exit(0)
   elseif key == 118 then  -- 'v'
     renderVelocity = not renderVelocity
@@ -197,17 +216,17 @@ function tfluids.keyboardFunc(key, x, y)
     print("Re-Loading Data!")
     tfluids.loadData()
   elseif key == 99 then  -- 'c'
-    mconf.vorticityConfinementAmp = mconf.vorticityConfinementAmp + 0.025
+    mconf.vorticityConfinementAmp = mconf.vorticityConfinementAmp + 0.25
     print("mconf.vorticityConfinementAmp = " .. mconf.vorticityConfinementAmp)
   elseif key == 120 then -- 'x'
     mconf.vorticityConfinementAmp =
-        math.max(mconf.vorticityConfinementAmp - 0.025, 0)
+        math.max(mconf.vorticityConfinementAmp - 0.25, 0)
     print("mconf.vorticityConfinementAmp = " .. mconf.vorticityConfinementAmp)
   elseif key == 97 then  -- 'a'
-    if mconf.advectionMethod == 'rk2' then
+    if mconf.advectionMethod == 'maccormack' then
       mconf.advectionMethod = 'euler'
     else
-      mconf.advectionMethod = 'rk2'
+      mconf.advectionMethod = 'maccormack'
     end
     print('Using Advection method: ' .. mconf.advectionMethod)
   elseif key == 43 then  -- '+'
@@ -217,18 +236,18 @@ function tfluids.keyboardFunc(key, x, y)
     mconf.dt = mconf.dt / 1.25
     print('mconf.dt = ' .. mconf.dt)
   elseif key == 103 then  -- 'g'
-    renderGeometry = not renderGeometry
+    renderObstacles = not renderObstacles
   elseif key == 98 then  -- 'b'
     if batchGPU.UBC ~= nil then
       tfluids.removeBCs(batchGPU)
       print('Plume BCs OFF')
     else
-      local color = colors[curColor + 1]
+      curColor = math.mod(curColor + 1, numColors)
+      local densityVal = colors[curColor]
       local uScale = 10
       local rad = 0.05  -- Fraction of xdim
-      tfluids.createPlumeBCs(batchGPU, color, uScale, rad)
+      tfluids.createPlumeBCs(batchGPU, densityVal, uScale, rad)
       print('Plume BCs ON')
-      curColor = math.mod(curColor + 1, numColors)
     end
   elseif key == 110 then  -- 'n'
     if mconf.buoyancyScale == 0 then
@@ -238,6 +257,15 @@ function tfluids.keyboardFunc(key, x, y)
       mconf.buoyancyScale = 0
       print('buoyancy OFF')
     end
+  elseif key == 115 then -- 's'
+    if mconf.simMethod == 'convnet' then
+      mconf.simMethod = 'jacobi'
+    elseif mconf.simMethod == 'jacobi' then
+      mconf.simMethod = 'pcg'
+    elseif mconf.simMethod == 'pcg' then
+      mconf.simMethod = 'convnet'
+    end
+    print('mconf.simMethod = ' .. mconf.simMethod)
   end
 end
 -- LuaGL needs keyboardFunc to be global.
@@ -250,7 +278,7 @@ print('  "v" render velocity ON/OFF')
 print('  "p" render pressure ON/OFF')
 print('  "d" render divergence ON/OFF')
 print('  "r" reload the data')
-print('  "g" render geometry ON/OFF')
+print('  "g" render obstacles ON/OFF')
 print('\n  MODEL SETTINGS:')
 print('  "c" increase vorticity confinement')
 print('  "x" decrease vorticity confinement')
@@ -258,6 +286,7 @@ print('  "a" cycle first / second order advection methods')
 print('  "+" / "-" increase or decrease timestep')
 print('  "b" toggle "plume" boundary condition ON/OFF')
 print('  "n" toggle buoyancy ON/OFF')
+print('  "s" toggle simulation method (convnet / jacobi / pcg)')
 print('')
 
 function tfluids.drawFullscreenQuad(blend, color, flip)
@@ -342,7 +371,7 @@ function tfluids.displayFunc()
       lastFrameCount = frameCounter
       local ms = string.format('%3.0f ms total',
                                (elapsed / frames) * 1000)
-      local msSim = string.format('%3.0f ms conv+adv only',
+      local msSim = string.format('%3.0f ms tfluids.simulate() only',
                                   (tSimulate / frames) * 1000)
       local fps = string.format('FPS: %d', (frames / elapsed))
       print(fps .. ' / ' .. ms .. ' / ' .. msSim)
@@ -359,12 +388,9 @@ function tfluids.displayFunc()
   local maxDivergence = 0
   local divergenceGPU
   do
-    local _, UGPU, geomGPU = tfluids.getPUGeomDensityReference(batchGPU)
-    tfluids._UDivGPU = tfluids._UDivGPU or torch.CudaTensor()
-    tfluids._UDivGPU:resizeAs(geomGPU)
-    divergenceGPU = tfluids._UDivGPU
-    tfluids.calcVelocityDivergence(UGPU, geomGPU, tfluids._UDivGPU)
-    maxDivergence = tfluids._UDivGPU:max()  -- Probably should have abs!
+    local _, UGPU, flagsGPU = tfluids.getPUFlagsDensityReference(batchGPU)
+    divergenceGPU = divergenceNet:forward({UGPU, flagsGPU})
+    maxDivergence = divergenceGPU:max()
   end
 
   if mouseDown[2] then
@@ -375,14 +401,15 @@ function tfluids.displayFunc()
       y = windowResolutionY - y + 1
     end
     local gridX, gridY = convertMousePosToGrid(mouseLastPos.x, y)
-    local _, _, _, densityGPU = tfluids.getPUGeomDensityReference(batchGPU)
+    local _, _, _, densityGPU = tfluids.getPUFlagsDensityReference(batchGPU)
     -- TODO(tompson): This is ugly and slow.
-    densityGPU[{1, {}, depth, gridY, gridX}]:copy(
-        torch.CudaTensor(colors[curColor + 1]))
+    for i = 1, 3 do
+      densityGPU[i][{1, 1, depth, gridY, gridX}] = colors[curColor + 1][i]
+    end
   end
 
   -- Visualize the scalar background.
-  assert(tr.twoDim, 'Only 2D visualization is supported')
+  assert(not tr.is3D, 'Only 2D visualization is supported')
   local function VisualizeScalarTensor(tensor, rescale, filter)
     im:resize(unpack(tensor:size():totable()))
     im:copy(tensor)  -- Copy to temporary buffer.
@@ -397,29 +424,29 @@ function tfluids.displayFunc()
   end
 
   if renderPressure then
-    local pGPU = tfluids.getPUGeomDensityReference(batchGPU)
+    local pGPU = tfluids.getPUFlagsDensityReference(batchGPU)
     VisualizeScalarTensor(pGPU:squeeze(), true, filterTexture)
   elseif renderDivergence then
     -- Calculated above.
     VisualizeScalarTensor(divergenceGPU:squeeze(), true, filterTexture)
   else
-    local _, _, _, densityGPU = tfluids.getPUGeomDensityReference(batchGPU)
+    local _, _, _, densityGPU = tfluids.getPUFlagsDensityReference(batchGPU)
+    densityGPU = densityToRGBNet:forward(densityGPU)
     VisualizeScalarTensor(densityGPU:squeeze(), false, filterTexture)
   end
   tfluids.drawFullscreenQuad(nil, nil, flipRendering)
 
-  if renderGeometry then
-    local _, _, geomGPU = tfluids.getPUGeomDensityReference(batchGPU)
-    if geomGPU:max() > 0 then
-      VisualizeScalarTensor(geomGPU:squeeze(), false, true)
-      tfluids.drawFullscreenQuad(true, {1, 1, 1, 1}, flipRendering)
-    end
+  if renderObstacles then
+    local _, _, flagsGPU = tfluids.getPUFlagsDensityReference(batchGPU)
+    local occupancy = flagsToOccupancyNet:forward(flagsGPU)
+    VisualizeScalarTensor(occupancy:squeeze(), false, false)
+    tfluids.drawFullscreenQuad(true, {1, 1, 1, 1}, flipRendering)
   end
 
   -- Render velocity arrows on top.
   if renderVelocity then
-    local _, UGPU = tfluids.getPUGeomDensityReference(batchGPU)
-    local _, UCPU = tfluids.getPUGeomDensityReference(batchCPU)
+    local _, UGPU = tfluids.getPUFlagsDensityReference(batchGPU)
+    local _, UCPU = tfluids.getPUFlagsDensityReference(batchCPU)
     UCPU:copy(UGPU)  -- GPU --> CPU copy.
     tfluids.drawVelocityField(UCPU, flipRendering)
   end
@@ -513,8 +540,8 @@ function tfluids.addMouseVelocityInput(x, y, velX, velY, rightButton)
 
   -- translate x,y from pixel space to grid cell indices
   -- assuming grid is from [0, 1].
-  local _, UGPU = tfluids.getPUGeomDensityReference(batchGPU)
-  local _, UCPU = tfluids.getPUGeomDensityReference(batchCPU)
+  local _, UGPU = tfluids.getPUFlagsDensityReference(batchGPU)
+  local _, UCPU = tfluids.getPUFlagsDensityReference(batchCPU)
   -- TODO(tompson): This is slow.  We sync from GPU --> CPU --> GPU just to
   -- fill in a few values. We should fill in the amplitude values to a CPU
   -- buffer (a small one). Sync this to the GPU then apply the accumulation on
@@ -583,7 +610,8 @@ function tfluids.initgl(output)
   gl.LoadIdentity()
 
   texGLIDs[#texGLIDs + 1] = gl.GenTextures(1)[1]
-  local _, _, _, densityGPU = tfluids.getPUGeomDensityReference(batchGPU)
+  local _, _, _, densityGPU = tfluids.getPUFlagsDensityReference(batchGPU)
+  densityGPU = densityToRGBNet:forward(densityGPU)
   tfluids.loadTensorTexture(densityGPU[{1, 1, 1}]:float():clamp(0, 1):squeeze(),
                             texGLIDs[#texGLIDs], filterTexture)
 

@@ -18,26 +18,29 @@
 -- We give a single boundary condition example of a plume from the bottom of
 -- the grid with otherwise open boundary conditions.
 --
--- The geometry in the scene is controlled through the 'loadVoxelModel'
+-- The model in the scene is controlled through the 'loadVoxelModel'
 -- parameter.
 --
 -- The output is a sequence of .vbox files in the CNNFluids/blender folder.
 -- These files are then loaded into blender for rendering.
+--
+-- Typical useage:
+-- qlua fluid_net_3d_sim.lua -modelFilename myModel -loadVoxelModel arc \
+--                           -visualizeData true -saveData true
 
 local tfluids = require('tfluids')
 local paths = require('paths')
 dofile("lib/include.lua")
 dofile("lib/save_parameters.lua")
-dofile("lib/demo_utils.lua")
-dofile("lib/geom_export.lua")
-dofile("lib/geom_import_binvox.lua")
+dofile("lib/obstacles_import_binvox.lua")
 
 -- ****************************** Define Config ********************************
 local conf = torch.defaultConf()
 conf.batchSize = 1
 conf.loadModel = true
-conf.visualizeData = false
+conf.visualizeData = true
 conf.saveData = true
+conf.plumeSimMethod = 'convnet'  -- options are: 'convnet', 'jacobi', 'pcg'
 conf = torch.parseArgs(conf)  -- Overwrite conf params from the command line.
 assert(conf.batchSize == 1, 'The batch size must be one')
 assert(conf.loadModel == true, 'You must load a pre-trained model')
@@ -50,12 +53,10 @@ print(cutorch.getDeviceProperties(conf.gpu))
 -- ***************************** Create the model ******************************
 conf.modelDirname = conf.modelDir .. '/' .. conf.modelFilename
 local mconf, model = torch.loadModel(conf.modelDirname)
-mconf.vorticityConfinementAmp = 0.8
-mconf.buoyancyScale = 1
 model:cuda()
 print('==> Loaded model from: ' .. conf.modelDirname)
 torch.setDropoutTrain(model, false)
-assert(not mconf.twoDim, 'The model must be 3D')
+assert(mconf.is3D, 'The model must be 3D')
 print('    mconf:')
 print(torch.tableToString(mconf))
 
@@ -64,11 +65,23 @@ local res = 128
 local batchCPU = {
     pDiv = torch.FloatTensor(conf.batchSize, 1, res, res, res):fill(0),
     UDiv = torch.FloatTensor(conf.batchSize, 3, res, res, res):fill(0),
-    geom = torch.FloatTensor(conf.batchSize, 1, res, res, res):fill(0),
-    density = torch.FloatTensor(conf.batchSize, 3, res, res, res):fill(0)
+    flags = tfluids.emptyDomain(torch.FloatTensor(
+        conf.batchSize, 1, res, res, res), true),
+    density = torch.FloatTensor(conf.batchSize, 1, res, res, res):fill(0)
 }
 print("running simulation at resolution " .. res .. "^3")
--- *************************** Load a model into geom **************************
+
+-- **************** Set some nice looking simulation variables  ****************
+mconf.vortictyConfinementAmp = 0.0
+mconf.buoyancyScale = 2.0
+mconf.dt = 0.1
+local plumeScale = 1.0
+local numFrames = 768
+local outputDecimation = 3
+mconf.advectionMethod = 'maccormack'  -- options are 'euler', 'maccormack'
+mconf.simMethod = conf.plumeSimMethod
+
+-- *************************** Load a model into flags *************************
 local voxels = {}
 local outDir
 if conf.loadVoxelModel ~= "none" then
@@ -92,7 +105,15 @@ if conf.loadVoxelModel ~= "none" then
   voxels.min = bb.min
   voxels.max = bb.max
 
-  batchCPU.geom[{{},1}] = voxels.data:view(1, res, res, res)
+  -- We need to turn the occupancy grid {0, 1} into a proper flags grid.
+  local occ = voxels.data:view(1, 1, res, res, res)
+  -- We need to copy in the occupancy data, but ONLY within the 1 pix / vox
+  -- border.
+  occ = occ[{{}, {}, {2, res - 1}, {2, res - 1}, {2, res - 1}}]:contiguous()
+  local flagsInBounds =
+      batchCPU.flags[{{}, {}, {2, res - 1}, {2, res - 1}, {2, res - 1}}]
+  flagsInBounds:copy((occ * tfluids.CellType.TypeObstacle) +
+                     ((1 - occ) * tfluids.CellType.TypeFluid))
 else
   outDir = '../blender/mushroom_cloud_render/'
 end
@@ -102,38 +123,24 @@ for key, value in pairs(batchCPU) do
   batchGPU[key] = value:cuda()
 end
 local frameCounter = 1
-local numFrames = 256
+
+local simulationTimeSec = numFrames * mconf.dt
+print('Simulating with dt = ' .. mconf.dt)
+print('Saving every ' .. outputDecimation .. ' frames')
+print('Simulating for ' .. numFrames .. ' frames (' .. simulationTimeSec ..
+      'sec)')
 
 -- ****************************** DATA FUNCTIONS *******************************
 -- Set up a plume boundary condition.
-local color = {1, 1, 1}
-local uScale = 1  -- 0 turns it off and will only use buoyancy.
+local densityVal = {1}
 local rad = 0.15
-tfluids.createPlumeBCs(batchGPU, color, uScale, rad)
---[[
--- You can measure the max velocity of the training set using:
-dofile("lib/include.lua")
-tr = torch.load("../data/datasets/preprocessed_output_current_3d_geom_tr.bin")
-UMax = {}
-for r = 1, #tr.runs do
-  torch.progress(r, #tr.runs)
-  for i = 1, tr.runs[r].ntimesteps do
-    local curUMax = 0
-    local p, Ux, Uy, Uz = tr:getSample(conf.dataDir, r, i)
-    curUMax = math.max(curUMax, Ux:abs():max())
-    curUMax = math.max(curUMax, Uy:abs():max())
-    curUMax = math.max(curUMax, Uz:abs():max())
-    UMax[#UMax + 1] = curUMax
-  end
-end
-UMax = torch.FloatTensor(UMax)
-gnuplot.hist(UMax, 200)
---]]
+tfluids.createPlumeBCs(batchGPU, densityVal, plumeScale, rad)
 
 -- ***************************** Create Voxel File ****************************
-local densityFile, densityFilename, geomFile, geomFilename
+local densityFile, densityFilename, obstaclesFile, obstaclesFilename
 if conf.saveData then
-  densityFilename = outDir .. '/density_output.vbox'
+  densityFilename = (outDir .. '/density_output_' .. conf.modelFilename ..
+                     '_dt' .. mconf.dt .. '.vbox')
   densityFile = torch.DiskFile(densityFilename,'w')
   densityFile:binary()
   densityFile:writeInt(res)
@@ -141,59 +148,90 @@ if conf.saveData then
   densityFile:writeInt(res)
   densityFile:writeInt(numFrames)
   
-  geomFilename = outDir .. '/geom_output.vbox'
-  geomFile = torch.DiskFile(geomFilename,'w')
-  geomFile:binary()
-  geomFile:writeInt(res)
-  geomFile:writeInt(res)
-  geomFile:writeInt(res)
-  geomFile:writeInt(1)
+  obstaclesFilename = (outDir .. '/geom_output.vbox')
+  obstaclesFile = torch.DiskFile(obstaclesFilename,'w')
+  obstaclesFile:binary()
+  obstaclesFile:writeInt(res)
+  obstaclesFile:writeInt(res)
+  obstaclesFile:writeInt(res)
+  obstaclesFile:writeInt(1)
 end
 
--- This is pretty aggressive.
-mconf.dt = 0.1
+local divNet = tfluids.VelocityDivergence():cuda()
 
 local hImage
 if conf.visualizeData then
+  local _, U, flags, _ = tfluids.getPUFlagsDensityReference(batchGPU)
+
+  local div = divNet:forward({U, flags})
+  div = div:squeeze():mean(1):squeeze()  -- Mean along z-channel.
+
   local density = batchGPU.density:mean(2):squeeze()
   density = density:mean(1):squeeze()  -- Average along Z dimension.
-  hImage = image.display{image = density, zoom = 512 / density:size(1),
-                         gui = false, legend = 'density'}
+
+  local sz = {1, div:size(1), div:size(2)}
+  local im = torch.cat(div:view(unpack(sz)), density:view(unpack(sz)), 1)
+  hImage = image.display{image = im, zoom = 512 / density:size(1),
+                         gui = false, legend = 'divergence & density',
+                         padding = 2}
 end
 
 -- ***************************** SIMULATION LOOP *******************************
--- Save a 2D slice just to visualize.
+local obstacles = batchGPU.flags:clone()
+sys.tic()
 for i = 1, numFrames do
-  collectgarbage()
+  if math.fmod(i, 20) == 0 then
+    collectgarbage()
+  end
   print('Simulating frame ' .. i .. ' of ' .. numFrames)
   
   tfluids.simulate(conf, mconf, batchGPU, model, false)
   -- Result is now on the GPU.
 
-  local p, U, geom, density = tfluids.getPUGeomDensityReference(batchGPU)
+  local p, U, flags, density = tfluids.getPUFlagsDensityReference(batchGPU)
 
   if conf.saveData then
+    -- Convert flags to obstacles array with 0, 1 for occupied.
+    -- The next call assumes that the domain is fluid everywhere else and that
+    -- there are no obstacle inflow regions.
+    tfluids.flagsToOccupancy(flags, obstacles)
+
     if i == 1 then
-      geomFile:writeFloat(
-          geom:squeeze():permute(3, 2, 1):float():contiguous():storage())
-      print('  ==> Saved geom to ' .. geomFilename)
+      obstaclesFile:writeFloat(
+          obstacles:squeeze():permute(3, 2, 1):float():contiguous():storage())
+      print('  ==> Saved obstacles to ' .. obstaclesFilename)
     end
-    -- Save greyscale density (so mean across RGB).
-    densityFile:writeFloat(density:mean(2):squeeze():permute(
-        3, 2, 1):float():contiguous():storage())
-    print('  ==> Saved density to ' .. densityFilename)
+    if math.fmod(i, outputDecimation) == 0 then
+      -- Save greyscale density (so mean across RGB).
+      densityFile:writeFloat(density:mean(2):squeeze():permute(
+          3, 2, 1):float():contiguous():storage())
+      print('  ==> Saved density to ' .. densityFilename)
+    end
   end
 
   if conf.visualizeData then
-    local density = batchGPU.density:mean(2):squeeze()
-    density = density:mean(1):squeeze():sqrt()
-    image.display{image = density, zoom = 512 / density:size(1),
-                  gui = false, legend = 'density', win = hImage}
+    -- This is SUPER slow. We're pulling off the GPU and then sending it back
+    -- as an image.display call. It probably limits framerate.
+    local div = divNet:forward({U, flags})
+    div = div:squeeze():mean(1):squeeze()  -- Mean along z-channel.
+
+    local density = batchGPU.density:mean(2):squeeze()  -- Mean of RGB
+    density = density:mean(1):squeeze():sqrt()  -- Mean along z-channel.
+
+    local sz = {1, div:size(1), div:size(2)}
+    local im = torch.cat(div:view(unpack(sz)), density:view(unpack(sz)), 1)
+    image.display{image = im, zoom = 512 / density:size(1),
+                  gui = false, legend = 'divergence & density', win = hImage,
+                  padding = 2}
   end
 end
+cutorch.synchronize()
+local t = sys.toc()
+print('All done!')
+print('Processing time: ' .. (1000 * t / numFrames) .. ' ms per frame')
 
 if conf.saveData then
   densityFile:close()
-  geomFile:close()
+  obstaclesFile:close()
 end
 

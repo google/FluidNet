@@ -16,28 +16,41 @@
 -- It is used for testing nn.InjectTensor.
 --
 -- The input is a tensor.
--- The output is a table of {input, self.staticTensor}.
+-- The output is a table of {input, self.staticData}. if staticData is a
+-- tensor or {input, self.staticData[1], ..., self.staticData[end]} if it is
+-- a table.
 
 local InjectTensor, parent =
   torch.class('nn.InjectTensor', 'nn.Module')
 
-function InjectTensor:__init(staticTensor)
+function InjectTensor:__init(staticData)
   parent.__init(self)
-  self.staticTensor = staticTensor
+  if torch.isTensor(staticData) then
+    self.staticData = {staticData}
+  else
+    assert(torch.type(staticData) == 'table')
+    self.staticData = staticData
+    for i = 1, #staticData do
+      assert(torch.isTensor(staticData[i]))
+    end
+  end
   self.output = {}
 end
 
 function InjectTensor:updateOutput(input)
   assert(torch.isTensor(input))
   self.output[1] = input
-  self.output[2] = self.staticTensor
+  for i = 1, #self.staticData do
+    self.output[i + 1] = self.staticData[i]
+  end
 
   return self.output
 end
 
 function InjectTensor:updateGradInput(input, gradOutput)
   -- Assume updateOutput has already been called.
-  assert(torch.type(gradOutput) == 'table' and #gradOutput == 2)
+  assert(torch.type(gradOutput) == 'table' and
+         #gradOutput == #self.staticData + 1)
   assert(gradOutput[1]:isSameSizeAs(input))
   self.gradInput = gradOutput[1]
   
@@ -54,6 +67,9 @@ end
 
 function InjectTensor:type(type)
   parent.type(self, type)
+  for i = 1, #self.staticData do
+    self.staticData[i] = self.staticData[i]:type(type)
+  end
   self.output = {}
   return self
 end

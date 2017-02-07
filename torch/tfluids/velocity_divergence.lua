@@ -12,20 +12,15 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- This module calculates the FEM approximation of the divergence of a velocity
--- field. If there is no geom voxels than it is central difference FEM
--- internally and single sided diff on the border. If there is geometry, then
--- it uses single sided diff to avoid sampling inside geom cells.
---
--- The module takes in a table of {U, geom} and outputs UDiv of size
--- (batch, depth, height, width).
+-- This module calculates the FD approximation of the divergence of a velocity
+-- field (MAC grid).
 
-local tfluids = require('tfluids')
+local nn = require('nn')
 
-local VelocityDivergence, parent =
-  torch.class('nn.VelocityDivergence', 'nn.Module')
+local VelocityDivergence, parent = torch.class('tfluids.VelocityDivergence',
+                                               'nn.Module')
 
-function VelocityDivergence:__init(matchManta)
+function VelocityDivergence:__init()
   parent.__init(self)
   self.gradInput = {torch.Tensor(), torch.Tensor()}
 end
@@ -33,29 +28,24 @@ end
 function VelocityDivergence:updateOutput(input)
   assert(torch.type(input) == 'table' and #input == 2)
   local U = input[1]
-  local geom = input[2]
+  local flags = input[2]
 
-  assert(U:dim() == 5)  -- We include a batch dimension.
-  assert(geom:dim() == 4)
+  self.output:resizeAs(flags)
 
-  self.output:resizeAs(geom)
-
-  tfluids.calcVelocityDivergence(U, geom, self.output)
+  tfluids.velocityDivergenceForward(U, flags, self.output)
   return self.output 
 end
 
 function VelocityDivergence:updateGradInput(input, gradOutput)
-  -- Assume updateOutput has already been called.
-  assert(self.output:isSameSizeAs(gradOutput))
   local U = input[1]
-  local geom = input[2]
+  local flags = input[2]
 
   self.gradInput[1]:resizeAs(U)
-  self.gradInput[2]:resizeAs(geom):fill(0)  -- Fill with 0.
+  self.gradInput[2]:resizeAs(flags):fill(0)  -- Fill with 0.
 
   local gradU = self.gradInput[1]
 
-  tfluids.calcVelocityDivergenceBackward(gradU, U, geom, gradOutput)
+  tfluids.velocityDivergenceBackward(U, flags, gradOutput, gradU)
   return self.gradInput
 end
 

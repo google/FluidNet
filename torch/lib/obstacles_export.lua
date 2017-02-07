@@ -14,9 +14,9 @@
 
 local tfluids = require('tfluids')
 
-function tfluids.writeOutGeom(filename, geom)
-  assert(#geom:size() == 3)
-  local xdim, ydim, zdim = geom:size(1), geom:size(2), geom:size(3)
+function tfluids.writeOutObstacles(filename, flags)
+  assert(#flags:size() == 3)
+  local xdim, ydim, zdim = flags:size(1), flags:size(2), flags:size(3)
   -- Single cube data.  Template that will be modified for each cell.
   -- Vertices.
   local v0 = {0.0, 0.0, 0.0}
@@ -57,6 +57,8 @@ function tfluids.writeOutGeom(filename, geom)
   local yscale = 1.0 / ydim
   local zscale = 1.0 / zdim
 
+  local fluid = tfluids.CellType.TypeFluid
+
   for z = 1, zdim do
     local zpos = (z - 1) * zscale
     for y = 1, ydim do
@@ -64,19 +66,21 @@ function tfluids.writeOutGeom(filename, geom)
       for x = 1, zdim do
         local xpos = (x - 1) * xscale
         
-        if geom[{x, y, z}] > 0.0 then 
+        if flags[{x, y, z}] ~= fluid then
+          assert(flags[{x, y, z}] == tfluids.CellType.TypeObstacle,
+                 'writeOutObstacles can only export fluid + blocker domains.')
         
           --  If we are surounded by obstacles don't write out anything
           local skip = false
           if (z > 1 and z < zdim and x > 1 and x < xdim and y > 1
               and y < ydim) then
               skip = true
-              if geom[{x - 1, y, z}] == 0 then skip = false end
-              if geom[{x + 1, y, z}] == 0 then skip = false end
-              if geom[{x, y - 1, z}] == 0 then skip = false end
-              if geom[{x, y + 1, z}] == 0 then skip = false end
-              if geom[{x, y, z + 1}] == 0 then skip = false end
-              if geom[{x, y, z - 1}] == 0 then skip = false end
+              if flags[{x - 1, y, z}] == fluid then skip = false end
+              if flags[{x + 1, y, z}] == fluid then skip = false end
+              if flags[{x, y - 1, z}] == fluid then skip = false end
+              if flags[{x, y + 1, z}] == fluid then skip = false end
+              if flags[{x, y, z + 1}] == fluid then skip = false end
+              if flags[{x, y, z - 1}] == fluid then skip = false end
           end
           if skip == false then
             --  Remember how many vertices were in the mesh so the offset for 

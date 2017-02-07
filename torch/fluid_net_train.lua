@@ -26,8 +26,8 @@ local cudnn = torch.loadPackageSafe('cudnn')
 local cutorch = torch.loadPackageSafe('cutorch')
 local paths = require('paths')
 local optim = require('optim')
-local ProFi = torch.loadPackageSafe('ProFi')
 local mattorch = torch.loadPackageSafe('mattorch')
+local gnuplot = torch.loadPackageSafe('gnuplot')
 
 -- ****************************** Define Config ********************************
 local conf = torch.defaultConf()  -- Table with configuration and model params.
@@ -68,19 +68,13 @@ end
 torch.makeGlobal('_mconf', mconf)
 torch.makeGlobal('_model', model)
 
---[[
--- Funcs to visualize the data.
-_tr:visualizeData(_conf)  -- visualize a random run.
-_tr:visualizeData(_conf, 1) -- visualize a particular run.
---]]
-
 -- ********************* Define Criterion (loss) function **********************
 print '==> defining loss function'
 local criterion
 if mconf.lossFunc == 'fluid' then
   criterion = nn.FluidCriterion(
       mconf.lossPLambda, mconf.lossULambda, mconf.lossDivLambda,
-      mconf.lossFuncScaleInvariant)
+      mconf.lossFuncBorderWeight, mconf.lossFuncBorderWidth)
 else
   error('Incorrect lossFunc value.')
 end
@@ -115,49 +109,65 @@ else
   mconf.optimizationMethod = "default-sgd"
 end
 
--- ************************ a Visualize Training Batch *************************
+-- ************************ Visualize a Training Batch *************************
 --[[
 _tr:visualizeBatch(_conf, _mconf)  -- Visualize random batch.
 _tr:visualizeBatch(_conf, _mconf, {1})  -- Explicitly define batch samples.
 --]]
 
+-- *********************** Calculate dataset statistics ************************
+-- Calculate some statistics about the input channels to the network.
+--[[
+trMean, trStd, trL2 = _tr:calcDataStatistics(_conf, _mconf)
+_tr:plotDataStatistics(trMean, trStd, trL2)
+teMean, teStd, teL2 = _te:calcDataStatistics(_conf, _mconf)
+_te:plotDataStatistics(teMean, teStd, teL2)
+--]]
+
 -- ************************ Profile the model for the paper ********************
-if conf.profileFPROPTime > 0 then
+if conf.profile then
   local res = 128  -- The 3D data is 64x64x64 (which isn't that interesting).
-  print('==> Profiling FPROP for ' ..  conf.profileFPROPTime .. ' seconds' ..
+  local profileTime = 10
+  print('==> Profiling FPROP for ' ..  profileTime .. ' seconds' ..
         ' with grid res ' .. res)
   local nuchan, zdim
-  if mconf.twoDim then
+  if not mconf.is3D then
     nuchan = 2
     zdim = 1
   else
     nuchan = 3
     zdim = res
   end
+  -- Create a minimal (empty) batch to do a few FPROPs.
   local batchGPU = {
      pDiv = torch.CudaTensor(1, 1, zdim, res, res):fill(0), 
      UDiv = torch.CudaTensor(1, nuchan, zdim, res, res):fill(0),
-     geom = torch.CudaTensor(1, 1, zdim, res, res):fill(0),
+     flags = tfluids.emptyDomain(torch.CudaTensor(1, 1, zdim, res, res),
+                                 mconf.is3D)
   }
   model:evaluate()  -- Turn off training (so batch norm doesn't get messed up).
   local input = torch.getModelInput(batchGPU)
   model:forward(input)  -- Input once before we start profiling.
   cutorch.synchronize()  -- Make sure everything is allocated fully.
-  local t0 = sys.clock()
-  local t1 = t0
+  sys.tic()
   local niters = 0
-  while t1 - t0 < conf.profileFPROPTime do
+  while sys.toc() < profileTime do
     model:forward(input)
-    cutorch.synchronize()  -- Flush the GPU buffer.
-    t1 = sys.clock()
     niters = niters + 1
   end
-  print('    FPROP Time: ' .. 1000 * ((t1 - t0) / niters) .. ' ms / sample')
+  cutorch.synchronize()  -- Flush the GPU buffer.
+  local fpropTime = sys.toc() / niters
+  print('    FPROP Time: ' .. 1000 * fpropTime .. ' ms / sample')
 
   -- Also calculate the total FLOPS (with a print out per layer).
   local verbose = 1  -- Print out only nn nodes (ignore graph containers).
   local flops, peakMemory = torch.CalculateFlops(model, input, verbose)
   print('    TOTAL FLOPS: ' .. torch.HumanReadableNumber(flops) .. 'flops')
+
+  -- Store the flops in case we want it for later.
+  mconf.flops = flops
+  mconf.peakMemory = peakMemory
+  mconf.fpropTime = fpropTime
 
   torch.cleanupModel(model)
 end
@@ -179,11 +189,6 @@ if conf.train then
   logger:setNames{'trLoss', 'trPLoss', 'trULoss', 'trDivLoss',
                   'trLongTermDivLoss', 'teLoss', 'tePLoss', 'teULoss',
                   'teDivLoss', 'teLongTermDivLoss'}
-
-  if conf.profile then
-    assert(ProFi ~= nil, 'cannot profile without "luarocks install ProFi"')
-    ProFi:start()
-  end
 
   -- Perform training.
   print '==> starting training loop!'
@@ -215,11 +220,6 @@ if conf.train then
         trPerf.loss, trPerf.pLoss, trPerf.uLoss, trPerf.divLoss,
         trPerf.longTermDivLoss, tePerf.loss, tePerf.pLoss, tePerf.uLoss,
         tePerf.divLoss, tePerf.longTermDivLoss}
-  end
-
-  if conf.profile then
-    ProFi:stop()
-    ProFi:writeReport(conf.modelDirname .. '_profileReport.txt')
   end
 end
 

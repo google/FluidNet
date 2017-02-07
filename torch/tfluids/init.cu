@@ -16,73 +16,52 @@
 
 #include <algorithm>
 
-#include <TH.h>
+#include <TH.h>  // Includes THTensor macro (form THTensor.h).
 #include <luaT.h>
-#include "generic/tfluids.cu.h"
+#include "third_party/cell_type.h"
+#ifndef BUILD_WITHOUT_CUDA_FUNCS
+  #include "generic/tfluids.cu.h"
+#endif
+#include "generic/stack_trace.cc"
 
 // This type is common to both float and double implementations and so has
 // to be defined outside tfluids.cc.
-typedef struct Int3 {
-  int32_t x;
-  int32_t y;
-  int32_t z;
-} Int3;
+#include "generic/int3.cu.h"
 
-inline int32_t IX(const int32_t i, const int32_t j, const int32_t k,
-                  const Int3& dims) {
-#if defined(DEBUG)
-  assert(i >= 0 && i < dims.x);
-  assert(j >= 0 && j < dims.y);
-  assert(k >= 0 && k < dims.z);
-#endif
-  return i + j * dims.x + k * dims.x * dims.y;
-}
-
-inline int32_t ClampInt32(const int32_t x, const int32_t low,
-                          const int32_t high) {
+inline int32_t clamp(const int32_t x, const int32_t low, const int32_t high) {
   return std::max<int32_t>(std::min<int32_t>(x, high), low);
 }
 
-#define torch_(NAME) TH_CONCAT_3(torch_, Real, NAME)
-#define torch_Tensor TH_CONCAT_STRING_3(torch., Real, Tensor)
-#define tfluids_(NAME) TH_CONCAT_3(tfluids_, Real, NAME)
+// Expand the CPU types (float and double).  This actually instantiates the
+// functions. Note: the order here is important.
 
-// Note: instead of calling THGenerateFloatTypes.h, we're going to hack into
-// the torch build system a little bit. This makes the tfluids library
-// compatible with the blaze build system (for reasons that aren't interesting,
-// but are very annoying).
-#define TH_GENERIC_FILE
+#define SOURCE_FILE "generic/vec3.cc"
+#include "generic/cc_types.h"
+#undef SOURCE_FILE
 
-#define real float
-#define accreal double
-#define Real Float
-#define THInf FLT_MAX
-#define TH_REAL_IS_FLOAT
-#include "generic/tfluids.cc"
-#undef accreal
-#undef real
-#undef Real
-#undef THInf
-#undef TH_REAL_IS_FLOAT
+#define SOURCE_FILE "third_party/grid.cc"
+#include "generic/cc_types.h"
+#undef SOURCE_FILE
 
-#define real double
-#define accreal double
-#define Real Double
-#define THInf DBL_MAX
-#define TH_REAL_IS_DOUBLE
-#include "generic/tfluids.cc"
-#undef accreal
-#undef real
-#undef Real
-#undef THInf
-#undef TH_REAL_IS_DOUBLE
+#define SOURCE_FILE "generic/tfluids.cc"
+#include "generic/cc_types.h"
+#undef SOURCE_FILE
 
-#undef TH_GENERIC_FILE
+// setfieldint pushes the index and the field value on the stack, and then
+// calls lua_settable. The setfield function assumes that before the call the
+// table is at the top of the stack (index -1).
+void setfieldint(lua_State* L, const char* index, int value) {
+  lua_pushstring(L, index);
+  lua_pushnumber(L, value);
+  lua_settable(L, -3);
+}
 
 LUA_EXTERNC DLL_EXPORT int luaopen_libtfluids(lua_State *L) {
   tfluids_FloatMain_init(L);
   tfluids_DoubleMain_init(L);
+#ifndef BUILD_WITHOUT_CUDA_FUNCS
   tfluids_CudaMain_init(L);
+#endif
 
   lua_newtable(L);
   lua_pushvalue(L, -1);
@@ -96,9 +75,33 @@ LUA_EXTERNC DLL_EXPORT int luaopen_libtfluids(lua_State *L) {
   luaT_setfuncs(L, tfluids_FloatMain__, 0);
   lua_setfield(L, -2, "float");
 
+#ifndef BUILD_WITHOUT_CUDA_FUNCS
   lua_newtable(L);
   luaT_setfuncs(L, tfluids_CudaMain_getMethodsTable(), 0);
   lua_setfield(L, -2, "cuda");
+#endif
+
+  // Create the CellType enum table.
+  lua_newtable(L);
+  setfieldint(L, "TypeNone", TypeNone);
+  setfieldint(L, "TypeFluid", TypeFluid);
+  setfieldint(L, "TypeObstacle", TypeObstacle);
+  setfieldint(L, "TypeEmpty", TypeEmpty);
+  setfieldint(L, "TypeInflow", TypeInflow);
+  setfieldint(L, "TypeOutflow", TypeOutflow);
+  setfieldint(L, "TypeOpen", TypeOpen);
+  setfieldint(L, "TypeStick", TypeStick);
+  setfieldint(L, "TypeReserved", TypeReserved);
+  setfieldint(L, "TypeZeroPressure", TypeZeroPressure);
+  lua_setfield(L, -2, "CellType");
+
+#ifndef BUILD_WITHOUT_CUDA_FUNCS
+  lua_pushboolean(L, true);
+#else
+  std::cout << "WARNING: tfluids compiled without CUDA." << std::endl;
+  lua_pushboolean(L, false);
+#endif
+  lua_setfield(L, -2, "withCUDA");
 
   return 1;
 }

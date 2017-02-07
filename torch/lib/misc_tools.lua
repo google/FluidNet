@@ -406,35 +406,6 @@ function torch.sigmoid(x)
   return y:cdiv(tmp:add(1))
 end
 
-function torch.sleep(sec)  -- CAN BE FRACTIONAL!
-  os.execute("sleep " .. tonumber(sec))
-end
-
-function torch.ls(dir)
-  local files = {}
-  --[[
-  -- EDIT: We might be searching for a file within a directory.
-  if paths.dirp(dir) == false then
-    error('Directory ' .. dir .. ' does not exist')
-  else
-  --]]
-    -- Collect the file and directory names
-    -- This method returns a sorted list on unix
-    for f in io.popen("ls " .. dir .. " 2> /dev/null"):lines() do
-      table.insert(files, f)
-    end
-    --[[
-    -- LFS doesn't return sorted arrays
-    for file in lfs.dir(dir) do
-      files[#files+1] = file
-    end
-    --]]
-  -- end
-  torch.sleep(0.001)
-  -- This is annoying, but if we don't add 1ms using throws interrupts.
-  return files
-end
-
 function torch.lastElem(T)
   return T[#T]
 end
