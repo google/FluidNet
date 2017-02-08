@@ -87,6 +87,14 @@ struct CudaVec3 {
     return ret;
   }
 
+  __host__ __device__ const CudaVec3 operator/(const float rhs) const {
+    CudaVec3 ret = *this;
+    ret.x /= rhs;
+    ret.y /= rhs;
+    ret.z /= rhs;
+    return ret;
+  }
+
   __host__ __device__ inline float& operator()(int32_t i) {
     switch (i) {
     case 0:

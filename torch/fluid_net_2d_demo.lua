@@ -159,6 +159,8 @@ mconf.buoyancyScale = 0
 mconf.vorticityConfinementAmp = 0
 mconf.dt = 4 / 60
 mconf.simMethod = 'convnet'
+mconf.advectionMethod = 'maccormackOurs'
+mconf.maccormackStrength = 0.75
 
 -- ******************************** OpenGL Funcs *******************************
 local function convertMousePosToGrid(x, y)
@@ -216,17 +218,25 @@ function tfluids.keyboardFunc(key, x, y)
     print("Re-Loading Data!")
     tfluids.loadData()
   elseif key == 99 then  -- 'c'
-    mconf.vorticityConfinementAmp = mconf.vorticityConfinementAmp + 0.25
+    mconf.vorticityConfinementAmp = (mconf.vorticityConfinementAmp +
+                                     0.5 * tfluids.getDx(batchCPU.flags))
     print("mconf.vorticityConfinementAmp = " .. mconf.vorticityConfinementAmp)
   elseif key == 120 then -- 'x'
     mconf.vorticityConfinementAmp =
-        math.max(mconf.vorticityConfinementAmp - 0.25, 0)
+        math.max(mconf.vorticityConfinementAmp -
+                 0.5 * tfluids.getDx(batchCPU.flags), 0)
     print("mconf.vorticityConfinementAmp = " .. mconf.vorticityConfinementAmp)
   elseif key == 97 then  -- 'a'
-    if mconf.advectionMethod == 'maccormack' then
-      mconf.advectionMethod = 'euler'
-    else
-      mconf.advectionMethod = 'maccormack'
+    local methods = {'maccormackOurs', 'maccormack', 'euler', 'eulerOurs'}
+    for i = 1, #methods do
+      if methods[i] == mconf.advectionMethod then
+        if i == #methods then
+          mconf.advectionMethod = methods[1]
+        else
+          mconf.advectionMethod = methods[i + 1]
+        end
+        break
+      end
     end
     print('Using Advection method: ' .. mconf.advectionMethod)
   elseif key == 43 then  -- '+'

@@ -18,10 +18,10 @@
 // advectScalar
 // *****************************************************************************
 
-__global__ void SemiLagrange(
-    CudaFlagGrid flags, CudaMACGrid vel, CudaRealGrid src, 
-    CudaRealGrid dst, const float dt, const bool is_levelset,
-    const int32_t order_space, const int32_t bnd) {
+__global__ void SemiLagrangeRK2Ours(
+    CudaFlagGrid flags, CudaMACGrid vel, CudaRealGrid src,
+    CudaRealGrid dst, const float dt, const int32_t order_space,
+    const int32_t bnd, const bool line_trace, const bool sample_outside_fluid) {
   int32_t b, chan, k, j, i;
   if (GetKernelIndices(flags, b, chan, k, j, i)) {
     return;
@@ -35,13 +35,247 @@ __global__ void SemiLagrange(
     return;
   }
 
-  CudaVec3 pos = (CudaVec3((float)i + 0.5f, (float)j + 0.5f, (float)k + 0.5f) -
-                  vel.getCentered(i, j, k, b) * dt);
-  dst(i, j, k, b) = src.getInterpolatedHi(pos, order_space, b);
+  if (!flags.isFluid(i, j, k, b)) {
+    // Don't advect solid geometry!
+    dst(i, j, k, b) = src(i, j, k, b);
+    return;
+  }
+
+  const CudaVec3 pos =
+      CudaVec3((float)i + 0.5f, (float)j + 0.5f, (float)k + 0.5f);
+  CudaVec3 displacement = vel.getCentered(i, j, k, b) * (-dt * 0.5f);
+
+  // Calculate a line trace from pos along displacement.
+  // NOTE: this is expensive (MUCH more expensive than Manta's routines), but
+  // can avoid some artifacts which would occur sampling into Geometry.
+  CudaVec3 half_pos;
+  const bool hit_bnd_half =
+      calcLineTrace(pos, displacement, flags, b, &half_pos, line_trace);
+
+  if (hit_bnd_half) {
+    // We hit the boundary, then as per Bridson, we should clamp the backwards
+    // trace. Note: if we treated this as a full euler step, we would have hit
+    // the same blocker because the line trace is linear.
+    if (!sample_outside_fluid) {
+      dst(i, j, k, b) =
+          src.getInterpolatedWithFluidHi(flags, half_pos, order_space, b);
+    } else {
+      dst(i, j, k, b) =
+          src.getInterpolatedHi(half_pos, order_space, b);
+    }
+    return;
+  }
+
+  // Otherwise, sample the velocity at this half-step location and do another
+  // backwards trace.
+  displacement.x = vel.getInterpolatedComponentHi<0>(half_pos, order_space, b);
+  displacement.y = vel.getInterpolatedComponentHi<1>(half_pos, order_space, b);
+  if (flags.is_3d()) {
+    displacement.z =
+        vel.getInterpolatedComponentHi<2>(half_pos, order_space, b);
+  }
+  displacement = displacement * (-dt);
+  CudaVec3 back_pos;
+  calcLineTrace(pos, displacement, flags, b, &back_pos, line_trace);
+
+  // Note: It actually doesn't matter if we hit the boundary on the second
+  // trace. We clamp the trace anyway.
+
+  // Finally, sample the field at this back position.
+  if (!sample_outside_fluid) {
+    dst(i, j, k, b) =
+        src.getInterpolatedWithFluidHi(flags, back_pos, order_space, b);
+  } else {
+    dst(i, j, k, b) =
+        src.getInterpolatedHi(back_pos, order_space, b);
+  }
 }
 
-__global__ void SemiLagrangeLoop(
+__global__ void SemiLagrangeRK3Ours(
     CudaFlagGrid flags, CudaMACGrid vel, CudaRealGrid src,
+    CudaRealGrid dst, const float dt, const int32_t order_space,
+    const int32_t bnd, const bool line_trace, const bool sample_outside_fluid) {
+  int32_t b, chan, k, j, i;
+  if (GetKernelIndices(flags, b, chan, k, j, i)) {
+    return;
+  }
+
+  if (i < bnd || i > flags.xsize() - 1 - bnd ||
+      j < bnd || j > flags.ysize() - 1 - bnd ||
+      (flags.is_3d() && (k < bnd || k > flags.zsize() - 1 - bnd))) {
+    // Manta zeros stuff on the border.
+    dst(i, j, k, b) = 0;
+    return;
+  }
+
+  if (!flags.isFluid(i, j, k, b)) {
+    // Don't advect solid geometry!
+    dst(i, j, k, b) = src(i, j, k, b);
+    return;
+  }
+
+  // We're implementing the RK3 from Bridson page 242.
+  // k1 = f(q^n)
+  const CudaVec3 k1_pos =
+      CudaVec3((float)i + 0.5f, (float)j + 0.5f, (float)k + 0.5f);
+  CudaVec3 k1 = vel.getCentered(i, j, k, b);
+
+  // Calculate a line trace from pos along displacement.
+  // NOTE: this is expensive (MUCH more expensive than Manta's routines), but
+  // can avoid some artifacts which would occur sampling into Geometry.
+  // k2 = f(q^n - 1/2 * dt * k1)
+  CudaVec3 k2_pos;
+  if (calcLineTrace(k1_pos, k1 * (-dt * 0.5f), flags, b, &k2_pos, line_trace)) {
+    // If we hit the boundary we'll truncate to an Euler step.
+    if (!sample_outside_fluid) {
+      dst(i, j, k, b) =
+        src.getInterpolatedWithFluidHi(flags, k2_pos, order_space, b);
+    } else {
+      dst(i, j, k, b) =
+        src.getInterpolatedHi(k2_pos, order_space, b);
+    }
+    return;
+  }
+  CudaVec3 k2;
+  k2.x = vel.getInterpolatedComponentHi<0>(k2_pos, order_space, b);
+  k2.y = vel.getInterpolatedComponentHi<1>(k2_pos, order_space, b);
+  if (flags.is_3d()) {
+    k2.z = vel.getInterpolatedComponentHi<2>(k2_pos, order_space, b);
+  }
+
+  // k3 = f(q^n - 3/4 * dt * k2)
+  CudaVec3 k3_pos;
+  if (calcLineTrace(k1_pos, k2 * (-dt * 0.75f), flags, b, &k3_pos,
+                    line_trace)) {
+    // If we hit the boundary we'll truncate to the k2 position (euler step).
+    if (!sample_outside_fluid) {
+      dst(i, j, k, b) =
+        src.getInterpolatedWithFluidHi(flags, k2_pos, order_space, b);
+    } else {
+      dst(i, j, k, b) =
+        src.getInterpolatedHi(k2_pos, order_space, b);
+    }
+    return;
+  }
+  CudaVec3 k3;
+  k3.x = vel.getInterpolatedComponentHi<0>(k3_pos, order_space, b);
+  k3.y = vel.getInterpolatedComponentHi<1>(k3_pos, order_space, b);
+  if (flags.is_3d()) {
+    k3.z = vel.getInterpolatedComponentHi<2>(k3_pos, order_space, b);
+  } 
+
+  // Finally calculate the effective velocity and perform a line trace.
+  CudaVec3 back_pos;
+  CudaVec3 displacement = (k1 * (-dt * (2.0f / 9.0f)) +
+                           k2 * (-dt * (3.0f / 9.0f)) +
+                           k3 * (-dt * (4.0f / 9.0f)));
+  calcLineTrace(k1_pos, displacement, flags, b, &back_pos, line_trace);
+
+  // Finally, sample the field at this back position.
+  if (!sample_outside_fluid) {
+    dst(i, j, k, b) =
+        src.getInterpolatedWithFluidHi(flags, back_pos, order_space, b);
+  } else {
+    dst(i, j, k, b) =
+        src.getInterpolatedHi(back_pos, order_space, b);
+  }
+}
+
+// This is the same kernel as our other Euler kernel, except it saves the
+// particle trace position. This is used for our maccormack routine (we'll do
+// a local search around these positions in our clamp routine).
+__global__ void SemiLagrangeEulerOursSavePos(
+    CudaFlagGrid flags, CudaMACGrid vel, CudaRealGrid src,
+    CudaRealGrid dst, const float dt, const int32_t order_space,
+    const int32_t bnd, const bool line_trace, const bool sample_outside_fluid,
+    CudaVecGrid pos) {
+  int32_t b, chan, k, j, i;
+  if (GetKernelIndices(flags, b, chan, k, j, i)) {
+    return;
+  }
+
+  if (i < bnd || i > flags.xsize() - 1 - bnd ||
+      j < bnd || j > flags.ysize() - 1 - bnd ||
+      (flags.is_3d() && (k < bnd || k > flags.zsize() - 1 - bnd))) {
+    // Manta zeros stuff on the border.
+    dst(i, j, k, b) = 0;
+    pos.setSafe(i, j, k, b, CudaVec3(i, j, k) + 0.5f);
+    return;
+  }
+
+  if (!flags.isFluid(i, j, k, b)) {
+    // Don't advect solid geometry!
+    dst(i, j, k, b) = src(i, j, k, b);
+    pos.setSafe(i, j, k, b, CudaVec3(i, j, k) + 0.5f);
+    return;
+  }
+
+  const CudaVec3 start_pos =
+      CudaVec3((float)i + 0.5f, (float)j + 0.5f, (float)k + 0.5f);
+  CudaVec3 displacement = vel.getCentered(i, j, k, b) * (-dt);
+
+  // Calculate a line trace from pos along displacement.
+  // NOTE: this is expensive (MUCH more expensive than Manta's routines), but
+  // can avoid some artifacts which would occur sampling into Geometry.
+  CudaVec3 back_pos;
+  calcLineTrace(start_pos, displacement, flags, b, &back_pos, line_trace);
+  pos.setSafe(i, j, k, b, back_pos);
+
+  // Sample at this back position.
+  if (!sample_outside_fluid) {
+    dst(i, j, k, b) =
+        src.getInterpolatedWithFluidHi(flags, back_pos, order_space, b);
+  } else {
+    dst(i, j, k, b) =
+        src.getInterpolatedHi(back_pos, order_space, b);
+  }
+}
+
+__global__ void SemiLagrangeEulerOurs(
+    CudaFlagGrid flags, CudaMACGrid vel, CudaRealGrid src,
+    CudaRealGrid dst, const float dt, const int32_t order_space,
+    const int32_t bnd, const bool line_trace, const bool sample_outside_fluid) {
+  int32_t b, chan, k, j, i;
+  if (GetKernelIndices(flags, b, chan, k, j, i)) {
+    return;
+  }
+
+  if (i < bnd || i > flags.xsize() - 1 - bnd ||
+      j < bnd || j > flags.ysize() - 1 - bnd ||
+      (flags.is_3d() && (k < bnd || k > flags.zsize() - 1 - bnd))) {
+    // Manta zeros stuff on the border.
+    dst(i, j, k, b) = 0;
+    return;
+  }
+
+  if (!flags.isFluid(i, j, k, b)) {
+    // Don't advect solid geometry!
+    dst(i, j, k, b) = src(i, j, k, b);
+    return;
+  }
+
+  const CudaVec3 pos =
+      CudaVec3((float)i + 0.5f, (float)j + 0.5f, (float)k + 0.5f);
+  CudaVec3 displacement = vel.getCentered(i, j, k, b) * (-dt);
+
+  // Calculate a line trace from pos along displacement.
+  // NOTE: this is expensive (MUCH more expensive than Manta's routines), but
+  // can avoid some artifacts which would occur sampling into Geometry.
+  CudaVec3 back_pos;
+  calcLineTrace(pos, displacement, flags, b, &back_pos, line_trace);
+
+  // Sample at this back position.
+  if (!sample_outside_fluid) {
+    dst(i, j, k, b) =
+        src.getInterpolatedWithFluidHi(flags, back_pos, order_space, b);
+  } else {
+    dst(i, j, k, b) =
+        src.getInterpolatedHi(back_pos, order_space, b);
+  }
+}
+
+__global__ void SemiLagrange(
+    CudaFlagGrid flags, CudaMACGrid vel, CudaRealGrid src, 
     CudaRealGrid dst, const float dt, const bool is_levelset,
     const int32_t order_space, const int32_t bnd) {
   int32_t b, chan, k, j, i;
@@ -118,9 +352,11 @@ __device__ __forceinline__ float doClampComponent(
 
     // clamp forward lookup to grid 
     const int32_t i0 = clamp<int32_t>(curr_pos.x, 0, gridSize.x - 1);
-    const int32_t j0 = clamp<int32_t>(curr_pos.y, 0, gridSize.y - 1); 
-    const int32_t k0 = clamp<int32_t>(curr_pos.z, 0, 
-                             (orig.is_3d() ? (gridSize.z - 1) : 1));
+    const int32_t j0 = clamp<int32_t>(curr_pos.y, 0, gridSize.y - 1);
+    // Note: there's a fix here, the Manta code clamps between 0 and 1 if
+    // not 3D which is wrong (it should be 0 always).
+    const int32_t k0 =
+        orig.is_3d() ? clamp<int32_t>(curr_pos.z, 0, (gridSize.z - 1)) : 0;
     const int32_t i1 = i0 + 1;
     const int32_t j1 = j0 + 1;
     const int32_t k1 = (orig.is_3d() ? (k0 + 1) : k0);
@@ -190,6 +426,101 @@ __global__ void MacCormackClamp(
   dst(i, j, k, b) = dval;
 }
 
+// Our version is a little different. It is a search around a single input
+// position for min and max values. If no valid values are found, then
+// false is returned (indicating that a clamp shouldn't be performed) otherwise
+// true is returned (and the clamp min and max bounds are set).
+__device__ __forceinline__ float getClampBounds(
+    CudaRealGrid src, CudaVec3 pos, const int32_t b,
+    CudaFlagGrid flags, const bool sample_outside_fluid, float* clamp_min,
+    float* clamp_max) {
+  float minv = CUDART_INF_F;
+  float maxv = -CUDART_INF_F;
+
+  // clamp forward lookup to grid 
+  const int32_t i0 = clamp<int32_t>(pos.x, 0, flags.xsize() - 1);
+  const int32_t j0 = clamp<int32_t>(pos.y, 0, flags.ysize() - 1);
+  const int32_t k0 =
+    src.is_3d() ? clamp<int32_t>(pos.z, 0, flags.zsize() - 1) : 0;
+  // Some modification here. Instead of looking just to the RHS, we will search
+  // all neighbors within a region.  This is more expensive but better handles
+  // border cases.
+  int32_t ncells = 0;
+  for (int32_t k = k0 - 1; k <= k0 + 1; k++) {
+    for (int32_t j = j0 - 1; j <= j0 + 1; j++) {
+      for (int32_t i = i0 - 1; i <= i0 + 1; i++) {
+        if (k < 0 || k >= flags.zsize() ||
+            j < 0 || j >= flags.ysize() ||
+            i < 0 || i >= flags.xsize()) {
+          // Outside bounds.
+          continue;
+        } else if (sample_outside_fluid || flags.isFluid(i, j, k, b)) {
+          // Either we don't care about clamping to values inside the fluid, or
+          // this is a fluid cell...
+          getMinMax(minv, maxv, src(i, j, k, b));
+          ncells++;
+        }
+      }
+    }
+  }
+
+  if (ncells < 1) {
+    // Only a single fluid cell found. Return false to indicate that a clamp
+    // shouldn't be performed.
+    return false;
+  } else {
+    *clamp_min = minv;
+    *clamp_max = maxv;
+    return true;
+  }
+}
+
+__global__ void MacCormackClampOurs(
+    CudaFlagGrid flags, CudaMACGrid vel, CudaRealGrid dst,
+    CudaRealGrid src, CudaRealGrid fwd, const float dt, const int32_t bnd,
+    CudaVecGrid fwd_pos, CudaVecGrid bwd_pos, const bool sample_outside_fluid) {
+  int32_t b, chan, k, j, i;
+  if (GetKernelIndices(flags, b, chan, k, j, i)) {
+    return;
+  }
+ 
+  if (i < bnd || i > flags.xsize() - 1 - bnd ||
+      j < bnd || j > flags.ysize() - 1 - bnd ||
+      (flags.is_3d() && (k < bnd || k > flags.zsize() - 1 - bnd))) {
+    return;
+  }
+
+  // Calculate the clamp bounds.
+  float clamp_min = CUDART_INF_F;
+  float clamp_max = -CUDART_INF_F;
+
+  // Calculate the clamp bounds around the forward position.
+  CudaVec3 pos = fwd_pos(i, j, k, b);
+  const bool do_clamp_fwd = getClampBounds(
+      src, pos, b, flags, sample_outside_fluid, &clamp_min, &clamp_max);
+
+  // Calculate the clamp bounds around the backward position. Recall that
+  // the bwd value was sampled on the fwd output (so src is replaced with fwd).
+  // EDIT(tompson): According to "An unconditionally stable maccormack method"
+  // only a forward search is required.
+  // pos = bwd_pos(i, j, k, b);
+  // const bool do_clamp_bwd = getClampBounds(
+  //     fwd, pos, b, flags, sample_outside_fluid, &clamp_min, &clamp_max);
+
+  float dval;
+  if (!do_clamp_fwd) {
+    // If the cell is surrounded by fluid neighbors either in the fwd or
+    // backward directions, then we need to revert to an euler step.
+    dval = fwd(i, j, k, b);
+  } else {
+    // We found valid values with which to clamp the maccormack corrected
+    // quantity. Apply this clamp.
+    dval = clamp<float>(dst(i, j, k, b), clamp_min, clamp_max);
+  }
+
+  dst(i, j, k, b) = dval;
+}
+
 static int tfluids_CudaMain_advectScalar(lua_State* L) {
   THCState* state = cutorch_getstate(L);
 
@@ -208,10 +539,16 @@ static int tfluids_CudaMain_advectScalar(lua_State* L) {
   THCudaTensor* tensor_bwd = reinterpret_cast<THCudaTensor*>(
       luaT_checkudata(L, 6, "torch.CudaTensor"));
   const bool is_3d = static_cast<bool>(lua_toboolean(L, 7));
-  const std::string method = static_cast<std::string>(lua_tostring(L, 8));
-  const int32_t boundary_width = static_cast<int32_t>(lua_tointeger(L, 9));
-  THCudaTensor* tensor_s_dst = reinterpret_cast<THCudaTensor*>(
+  const std::string method_str = static_cast<std::string>(lua_tostring(L, 8));
+  THCudaTensor* tensor_fwd_pos = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 9, "torch.CudaTensor"));
+  THCudaTensor* tensor_bwd_pos = reinterpret_cast<THCudaTensor*>(
       luaT_checkudata(L, 10, "torch.CudaTensor"));
+  const int32_t boundary_width = static_cast<int32_t>(lua_tointeger(L, 11));
+  const bool sample_outside_fluid = static_cast<bool>(lua_toboolean(L, 12));
+  const float maccormack_strength = static_cast<float>(lua_tonumber(L, 13));
+  THCudaTensor* tensor_s_dst = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 14, "torch.CudaTensor"));
 
   CudaFlagGrid flags = toCudaFlagGrid(state, tensor_flags, is_3d);
   CudaMACGrid vel = toCudaMACGrid(state, tensor_u, is_3d);
@@ -221,39 +558,76 @@ static int tfluids_CudaMain_advectScalar(lua_State* L) {
   // The maccormack method also needs fwd and bwd temporary arrays.
   CudaRealGrid fwd = toCudaRealGrid(state, tensor_fwd, is_3d);
   CudaRealGrid bwd = toCudaRealGrid(state, tensor_bwd, is_3d);
+  CudaVecGrid fwd_pos = toCudaVecGrid(state, tensor_fwd_pos, is_3d);
+  CudaVecGrid bwd_pos = toCudaVecGrid(state, tensor_bwd_pos, is_3d);
 
-  if (method != "maccormack" && method != "euler") {
-    luaL_error(L, "advectScalar method is not supported.");
-  }
-  const int32_t order = method == "euler" ? 1 : 2;
+  AdvectMethod method = StringToAdvectMethod(L, method_str);
+
   const bool is_levelset = false;  // We never advect them.
   const int32_t order_space = 1;
+  // A full line trace along every ray is expensive but correct (applies to our
+  // methods only).
+  const bool line_trace = true;
 
   // Do the forward step.
   // LaunchKernel args: lua_State, func, domain, args...
   const int32_t bnd = 1;
-  if (order == 1) {
+  if (method == ADVECT_EULER_MANTA) {
     LaunchKernel(L, &SemiLagrange, flags,
                  flags, vel, src, dst, dt, is_levelset, order_space, bnd);
     // We're done. The forward Euler step is already in the output array.
-    return 0;
+  } else if (method == ADVECT_RK2_OURS) {
+    LaunchKernel(L, &SemiLagrangeRK2Ours, flags,
+                 flags, vel, src, dst, dt, order_space, bnd, line_trace,
+                 sample_outside_fluid);
+  } else if (method == ADVECT_EULER_OURS) {
+    LaunchKernel(L, &SemiLagrangeEulerOurs, flags,
+                 flags, vel, src, dst, dt, order_space, bnd, line_trace,
+                 sample_outside_fluid);
+  } else if (method == ADVECT_RK3_OURS) {
+    LaunchKernel(L, &SemiLagrangeRK3Ours, flags,
+                 flags, vel, src, dst, dt, order_space, bnd, line_trace,
+                 sample_outside_fluid);
+  } else if (method == ADVECT_MACCORMACK_MANTA ||
+             method == ADVECT_MACCORMACK_OURS) {
+    // Do the forwards step.
+    if (method == ADVECT_MACCORMACK_MANTA) {
+      LaunchKernel(L, &SemiLagrange, flags,
+                   flags, vel, src, fwd, dt, is_levelset, order_space, bnd);
+    } else {
+      LaunchKernel(L, &SemiLagrangeEulerOursSavePos, flags,
+                   flags, vel, src, fwd, dt, order_space, bnd, line_trace,
+                   sample_outside_fluid, fwd_pos);
+    }
+
+    // Do the backwards step.
+    if (method == ADVECT_MACCORMACK_MANTA) {
+      LaunchKernel(L, &SemiLagrange, flags,
+                   flags, vel, fwd, bwd, -dt, is_levelset, order_space, bnd);
+    } else {
+      LaunchKernel(L, &SemiLagrangeEulerOursSavePos, flags,
+                   flags, vel, fwd, bwd, -dt, order_space, bnd, line_trace,
+                   sample_outside_fluid, bwd_pos);
+    }
+
+    // Perform the correction.
+    LaunchKernel(L, &MacCormackCorrect, flags,
+                 flags, src, fwd, bwd, dst, maccormack_strength, is_levelset);
+
+    // Perform clamping.
+    if (method == ADVECT_MACCORMACK_MANTA) {
+      LaunchKernel(L, &MacCormackClamp, flags,
+                   flags, vel, dst, src, fwd, dt, bnd);
+    } else {
+      LaunchKernel(L, &MacCormackClampOurs, flags,
+                   flags, vel, dst, src, fwd, dt, bnd, fwd_pos, bwd_pos,
+                   sample_outside_fluid);
+    }
   } else {
-    LaunchKernel(L, &SemiLagrange, flags,
-                 flags, vel, src, fwd, dt, is_levelset, order_space, bnd);
+     std::stringstream ss;
+     ss << "advection method (" << method_str << ") is not supported";
+     luaL_error(L, ss.str().c_str());
   }
-
-  // Do the backwards step.
-  LaunchKernel(L, &SemiLagrange, flags,
-               flags, vel, fwd, bwd, -dt, is_levelset, order_space, bnd);
-
-  // Perform the correction.
-  const float strength = 1.0f;
-  LaunchKernel(L, &MacCormackCorrect, flags,
-               flags, src, fwd, bwd, dst, strength, is_levelset);
-
-  // Perform clamping.
-  LaunchKernel(L, &MacCormackClamp, flags,
-               flags, vel, dst, src, fwd, dt, bnd);
 
   return 0;  // Recall: number of return values on the lua stack.
 }
@@ -261,6 +635,75 @@ static int tfluids_CudaMain_advectScalar(lua_State* L) {
 // *****************************************************************************
 // advectVel
 // *****************************************************************************
+
+// Take a step along the vel from pos and sample the velocity there.
+__device__ __forceinline__ bool SemiLagrangeStepMAC(
+    const CudaFlagGrid& flags, const CudaMACGrid& vel, const CudaMACGrid& src,
+    const float scale, const bool line_trace, const int32_t order_space,
+    const CudaVec3& pos, const int32_t i, const int32_t j, const int32_t k,
+    const int32_t b, CudaVec3* val) {
+  // TODO(tompson): We really want to clamp to the SMALLEST of the steps in each
+  // dimension, however this is OK for now (because doing so would expensive)...
+  CudaVec3 xpos;
+  bool hitx = calcLineTrace(
+      pos, vel.getAtMACX(i, j, k, b) * scale, flags, b, &xpos, line_trace);
+  val->x = src.getInterpolatedComponentHi<0>(xpos, order_space, b);
+
+  CudaVec3 ypos;
+  bool hity = calcLineTrace(
+      pos, vel.getAtMACY(i, j, k, b) * scale, flags, b, &ypos, line_trace);
+  val->y = src.getInterpolatedComponentHi<1>(ypos, order_space, b);
+
+  bool hitz;
+  if (vel.is_3d()) {
+    CudaVec3 zpos;
+    hitz = calcLineTrace(
+        pos, vel.getAtMACZ(i, j, k, b) * scale, flags, b, &zpos, line_trace);
+    val->z = src.getInterpolatedComponentHi<2>(zpos, order_space, b);
+  } else {
+    val->z = 0;
+    hitz = false;
+  }
+
+  return hitx || hity || hitz; 
+}
+
+__global__ void SemiLagrangeEulerOursMAC(
+    CudaFlagGrid flags, CudaMACGrid vel, CudaMACGrid src,
+    CudaMACGrid dst, const float dt, const int32_t order_space,
+    const int32_t bnd, const bool line_trace) {
+  int32_t b, chan, k, j, i;
+  if (GetKernelIndices(flags, b, chan, k, j, i)) {
+    return;
+  }
+
+  if (i < bnd || i > flags.xsize() - 1 - bnd ||
+      j < bnd || j > flags.ysize() - 1 - bnd ||
+      (flags.is_3d() && (k < bnd || k > flags.zsize() - 1 - bnd))) {
+    // Manta zeros stuff on the border.
+    dst.setSafe(i, j, k, b, CudaVec3(0, 0, 0));
+    return;
+  }
+
+  if (!flags.isFluid(i, j, k, b)) {
+    // Don't advect solid geometry!
+    dst.setSafe(i, j, k, b, src(i, j, k, b));
+    return;
+  }
+
+  // Get correct velocity at MAC position.
+  // No need to shift xpos etc. as lookup field is also shifted.
+  const CudaVec3 pos(static_cast<float>(i) + 0.5f,
+                     static_cast<float>(j) + 0.5f,
+                     static_cast<float>(k) + 0.5f);
+
+  CudaVec3 val;
+  SemiLagrangeStepMAC(flags, vel, src, -dt, line_trace, order_space, pos,
+                      i, j, k, b, &val);
+
+  dst.setSafe(i, j, k, b, val);
+}
+
 __global__ void SemiLagrangeMAC(
     CudaFlagGrid flags, CudaMACGrid vel, CudaMACGrid src,
     CudaMACGrid dst, const float dt, const int32_t order_space,
@@ -446,17 +889,24 @@ static int tfluids_CudaMain_advectVel(lua_State* L) {
   THCudaTensor* tensor_bwd = reinterpret_cast<THCudaTensor*>(
       luaT_checkudata(L, 5, "torch.CudaTensor"));
   const bool is_3d = static_cast<bool>(lua_toboolean(L, 6));
-  const std::string method = static_cast<std::string>(lua_tostring(L, 7));
+  const std::string method_str = static_cast<std::string>(lua_tostring(L, 7));
   const int32_t boundary_width = static_cast<int32_t>(lua_tointeger(L, 8));
+  const float maccormack_strength = static_cast<float>(lua_tonumber(L, 9));
   THCudaTensor* tensor_u_dst = reinterpret_cast<THCudaTensor*>(
-      luaT_checkudata(L, 9, "torch.CudaTensor"));
+      luaT_checkudata(L, 10, "torch.CudaTensor"));
 
-  if (method != "maccormack" && method != "euler") {
-    luaL_error(L, "advectScalar method is not supported.");
+  AdvectMethod method = StringToAdvectMethod(L, method_str);
+
+  // TODO(tompson): Implement RK2 and RK3 methods.
+  if (method == ADVECT_RK2_OURS || method == ADVECT_RK3_OURS) {
+    // We do not yet have an RK2 or RK3 implementation. Use Maccormack.
+    method = ADVECT_MACCORMACK_OURS;
   }
 
-  const int32_t order = method == "euler" ? 1 : 2;
   const int32_t order_space = 1;
+  // A full line trace along every ray is expensive but correct (applies to our
+  // methods only).
+  const bool line_trace = true;  
 
   CudaFlagGrid flags = toCudaFlagGrid(state, tensor_flags, is_3d);
   CudaMACGrid vel = toCudaMACGrid(state, tensor_u, is_3d);
@@ -469,31 +919,45 @@ static int tfluids_CudaMain_advectVel(lua_State* L) {
   CudaMACGrid fwd = toCudaMACGrid(state, tensor_fwd, is_3d);
   CudaMACGrid bwd = toCudaMACGrid(state, tensor_bwd, is_3d);
 
-  // Do the forward step.
   // LaunchKernel args: lua_State, func, domain, args...
   const int32_t bnd = 1;
-  if (order == 1) {
+  if (method == ADVECT_EULER_MANTA) {
     LaunchKernel(L, &SemiLagrangeMAC, flags,
                  flags, vel, src, dst, dt, order_space, bnd);
-    // We're done. The forward Euler step is already in the output array.
-    return 0;
+  } else if (method == ADVECT_EULER_OURS) {
+    LaunchKernel(L, &SemiLagrangeEulerOursMAC, flags,
+                 flags, vel, src, dst, dt, order_space, bnd, line_trace);
+  } else if (method == ADVECT_MACCORMACK_MANTA ||
+             method == ADVECT_MACCORMACK_OURS) {
+    // Do the forward step.
+    if (method == ADVECT_MACCORMACK_MANTA) {
+      LaunchKernel(L, &SemiLagrangeMAC, flags,
+                   flags, vel, src, fwd, dt, order_space, bnd);
+    } else {
+      LaunchKernel(L, &SemiLagrangeEulerOursMAC, flags,
+                   flags, vel, src, fwd, dt, order_space, bnd, line_trace);
+    }
+
+    // Do the backwards step.
+    if (method == ADVECT_MACCORMACK_MANTA) {
+      LaunchKernel(L, &SemiLagrangeMAC, flags,
+                   flags, vel, fwd, bwd, -dt, order_space, bnd);
+    } else {
+      LaunchKernel(L, &SemiLagrangeEulerOursMAC, flags,
+                   flags, vel, fwd, bwd, -dt, order_space, bnd, line_trace);
+    }
+
+    // Perform the correction.
+    LaunchKernel(L, &MacCormackCorrectMAC, flags,
+                 flags, src, fwd, bwd, dst, maccormack_strength);
+    
+    // Perform clamping.
+    // TODO(tompson): Perform our own clamping.
+    LaunchKernel(L, &MacCormackClampMAC, flags,
+                 flags, vel, dst, src, fwd, dt, bnd);
   } else {
-    LaunchKernel(L, &SemiLagrangeMAC, flags,
-                 flags, vel, src, fwd, dt, order_space, bnd);
+    THError("Advection method not supported!");
   }
-
-  // Do the backwards step.
-  LaunchKernel(L, &SemiLagrangeMAC, flags,
-               flags, vel, fwd, bwd, -dt, order_space, bnd);
-
-  // Perform the correction.
-  const float strength = 1.0f;
-  LaunchKernel(L, &MacCormackCorrectMAC, flags,
-               flags, src, fwd, bwd, dst, strength);
-
-  // Perform clamping.
-  LaunchKernel(L, &MacCormackClampMAC, flags,
-               flags, vel, dst, src, fwd, dt, bnd);
 
   return 0;  // Recall: number of return values on the lua stack.
 }

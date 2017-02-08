@@ -139,6 +139,15 @@ protected:
     return tensor_[b][c][k][j][i];
   }
 
+  __host__ __device__ __forceinline__ float& data(const Int3& pos, int32_t c,
+                                                  int32_t b) {
+    return tensor_[b][c][pos.z][pos.y][pos.x];
+  }
+  __host__ __device__ __forceinline__ float data(const Int3& pos, int32_t c,
+                                                 int32_t b) const {
+    return tensor_[b][c][pos.z][pos.y][pos.x];
+  }
+
   // Build index is used in interpol and interpolComponent. It replicates
   // the BUILD_INDEX macro in Manta's util/interpol.h.
   __host__ __device__ __forceinline__ void buildIndex(
@@ -213,6 +222,11 @@ public:
     return static_cast<int>(data(i, j, k, 0, b)) & TypeFluid;
   }
 
+  __host__ __device__ __forceinline__ bool isFluid(
+      const Int3& pos, int32_t b) const {
+    return static_cast<int>(data(pos.x, pos.y, pos.z, 0, b)) & TypeFluid;
+  }
+
   __host__ __device__ __forceinline__ bool isObstacle(
       int32_t i, int32_t j, int32_t k, int32_t b) const {
     return static_cast<int>(data(i, j, k, 0, b)) & TypeObstacle;
@@ -236,6 +250,12 @@ public:
   __host__ __device__ __forceinline__ bool isOutflow(
       int32_t i, int32_t j, int32_t k, int32_t b) const {
     return static_cast<int>(data(i, j, k, 0, b)) & TypeOutflow;
+  }
+
+  __host__ __device__ __forceinline__ bool isOutOfDomain(
+      int32_t i, int32_t j, int32_t k, int32_t b) const {
+    return (i < 0 || i >= xsize() || j < 0 || j >= ysize() || k < 0 ||
+            k >= zsize() || b < 0 || b >= nbatch());
   }
 };
 
@@ -271,6 +291,22 @@ public:
     return 0;
   }
 
+  __host__ __device__ __forceinline__ float getInterpolatedWithFluidHi(
+      const CudaFlagGrid& flags, const CudaVec3& pos, int32_t order,
+      int32_t b) const {
+    switch (order) {
+    case 1:
+      return interpolWithFluid(flags, pos, b);
+    case 2:
+      // Can't return errors from the kernel. CPU tests should catch.
+      break;
+    default:
+      // Can't return errors from the kernel. CPU tests should catch.
+      break;
+    }
+    return 0;
+  }
+
   __host__ __device__ __forceinline__ float interpol(
       const CudaVec3& pos, int32_t b) const {
     int32_t xi, yi, zi;
@@ -291,6 +327,141 @@ public:
                 data(xi, yi + 1, 0, 0, b) * t1) * s0
           + (data(xi + 1, yi, 0, 0, b) * t0 +
              data(xi + 1, yi + 1, 0, 0, b) * t1) * s1);
+    }
+  }
+
+  __host__ __device__ __forceinline__ float interpolWithFluid(
+      const CudaFlagGrid& flags, const CudaVec3& pos, int32_t ibatch) const {
+    int32_t xi, yi, zi;
+    float s0, t0, f0, s1, t1, f1;
+    buildIndex(xi, yi, zi, s0, t0, f0, s1, t1, f1, pos);
+
+    if (is_3d()) {
+      // val_ab = data(xi, yi, zi, 0, b) * t0 +
+      //          data(xi, yi + 1, zi, 0, b) * t1
+      const Int3 p_a(xi, yi, zi);
+      const Int3 p_b(xi, yi + 1, zi);
+      bool is_fluid_ab;
+      float val_ab;
+      interpol1DWithFluid(data(p_a, 0, ibatch), flags.isFluid(p_a, ibatch),
+                          data(p_b, 0, ibatch), flags.isFluid(p_b, ibatch),
+                          t0, t1, &is_fluid_ab, &val_ab);
+
+      // val_cd = data(xi + 1, yi, zi, 0, b) * t0 +
+      //          data(xi + 1, yi + 1, zi, 0, b) * t1
+      const Int3 p_c(xi + 1, yi, zi);
+      const Int3 p_d(xi + 1, yi + 1, zi);
+      bool is_fluid_cd;
+      float val_cd;
+      interpol1DWithFluid(data(p_c, 0, ibatch), flags.isFluid(p_c, ibatch),
+                          data(p_d, 0, ibatch), flags.isFluid(p_d, ibatch),
+                          t0, t1, &is_fluid_cd, &val_cd);
+
+      // val_ef = data(xi, yi, zi + 1, 0, b) * t0 +
+      //          data(xi, yi + 1, zi + 1, 0, b) * t1
+      const Int3 p_e(xi, yi, zi + 1); 
+      const Int3 p_f(xi, yi + 1, zi + 1);
+      bool is_fluid_ef;
+      float val_ef;
+      interpol1DWithFluid(data(p_e, 0, ibatch), flags.isFluid(p_e, ibatch),
+                          data(p_f, 0, ibatch), flags.isFluid(p_f, ibatch),
+                          t0, t1, &is_fluid_ef, &val_ef);
+
+      // val_gh = data(xi + 1, yi, zi + 1, 0, b) * t0 +
+      //          data(xi + 1, yi + 1, zi + 1, 0, b) * t1
+      const Int3 p_g(xi + 1, yi, zi + 1); 
+      const Int3 p_h(xi + 1, yi + 1, zi + 1);
+      bool is_fluid_gh;
+      float val_gh;
+      interpol1DWithFluid(data(p_g, 0, ibatch), flags.isFluid(p_g, ibatch),
+                          data(p_h, 0, ibatch), flags.isFluid(p_h, ibatch),
+                          t0, t1, &is_fluid_gh, &val_gh);
+
+      // val_abcd = val_ab * s0 + val_cd * s1
+      bool is_fluid_abcd;
+      float val_abcd;
+      interpol1DWithFluid(val_ab, is_fluid_ab, val_cd, is_fluid_cd,
+                          s0, s1, &is_fluid_abcd, &val_abcd);
+
+      // val_efgh = val_ef * s0 + val_gh * s1
+      bool is_fluid_efgh;
+      float val_efgh;
+      interpol1DWithFluid(val_ef, is_fluid_ef, val_gh, is_fluid_gh,
+                          s0, s1, &is_fluid_efgh, &val_efgh);
+
+      // val = val_abcd * f0 + val_efgh * f1
+      bool is_fluid;
+      float val;
+      interpol1DWithFluid(val_abcd, is_fluid_abcd, val_efgh, is_fluid_efgh,
+                          f0, f1, &is_fluid, &val);
+
+      if (!is_fluid) {
+        // None of the 8 cells were fluid. Just return the regular interp
+        // of all cells.
+        return interpol(pos, ibatch);
+      } else { 
+        return val;
+      }
+    } else {
+      // val_ab = data(xi, yi, 0, 0, b) * t0 +
+      //          data(xi, yi + 1, 0, 0, b) * t1
+      const Int3 p_a(xi, yi, 0);
+      const Int3 p_b(xi, yi + 1, 0);
+      bool is_fluid_ab;
+      float val_ab;
+      interpol1DWithFluid(data(p_a, 0, ibatch), flags.isFluid(p_a, ibatch),
+                          data(p_b, 0, ibatch), flags.isFluid(p_b, ibatch),
+                          t0, t1, &is_fluid_ab, &val_ab);
+
+      // val_cd = data(xi + 1, yi, 0, 0, b) * t0 +
+      //          data(xi + 1, yi + 1, 0, 0, b) * t1
+      const Int3 p_c(xi + 1, yi, 0);
+      const Int3 p_d(xi + 1, yi + 1, 0);
+      bool is_fluid_cd;
+      float val_cd;
+      interpol1DWithFluid(data(p_c, 0, ibatch), flags.isFluid(p_c, ibatch),
+                          data(p_d, 0, ibatch), flags.isFluid(p_d, ibatch),
+                          t0, t1, &is_fluid_cd, &val_cd);
+
+      // val = val_ab * s0 + val_cd * s1
+      bool is_fluid;
+      float val;
+      interpol1DWithFluid(val_ab, is_fluid_ab, val_cd, is_fluid_cd,
+                          s0, s1, &is_fluid, &val);
+
+      if (!is_fluid) {
+        // None of the 4 cells were fluid. Just return the regular interp
+        // of all cells.
+        return interpol(pos, ibatch);
+      } else {
+        return val;
+      }
+    } 
+  }
+
+private:
+  // Interpol1DWithFluid will return:
+  // 1. is_fluid = false if a and b are not fluid.
+  // 2. is_fluid = true and data(a) if b is not fluid.
+  // 3. is_fluid = true and data(b) if a is not fluid.
+  // 4. The linear interpolation between data(a) and data(b) if both are fluid.
+  static __host__ __device__ __forceinline__ void interpol1DWithFluid(
+      const float val_a, const bool is_fluid_a,
+      const float val_b, const bool is_fluid_b,
+      const float t_a, const float t_b,
+      bool* is_fluid_ab, float* val_ab) {
+    if (!is_fluid_a && !is_fluid_b) {
+      *val_ab = 0.0f;
+      *is_fluid_ab = false;
+    } else if (!is_fluid_a) {
+      *val_ab = val_b;
+      *is_fluid_ab = true;
+    } else if (!is_fluid_b) {
+      *val_ab = val_a;
+      *is_fluid_ab = true;
+    } else {
+      *val_ab = val_a * t_a + val_b * t_b;
+      *is_fluid_ab = true;
     }
   }
 };
