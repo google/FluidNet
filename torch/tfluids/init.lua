@@ -69,13 +69,32 @@ end
 -- @param s - input scalar field to advect
 -- @param U - input vel field (size(2) can be 2 or 3, indicating 2D / 3D)
 -- @param flags - input occupancy grid
--- @param method - OPTIONAL - "euler", "maccormack" (default).
+-- @param method - OPTIONAL - "euler", "maccormack", "rk2Ours",
+-- "eulerOurs", "rk3Ours", "maccormackOurs". You should use the "xxxOurs methods
+-- as we better handle boundary conditions. You can use the Manta
+-- implementations if you find ours are too slow.
 -- @param sDst - OPTIONAL - If non-nil then this will be the returned
 -- scalar field. Otherwise advection will be performed in-place.
+-- @param sampleOutsideFluid - OPTIONAL - For density advection we do not want
+-- to advect values inside non-fluid cells and so this should be set to false.
+-- For other quantities (like temperature), this should be true.
+-- Note that Manta's methods ALWAYS sample into non-fluid cells (so this only
+-- applies to our routines).
+-- @param maccormackStrength - OPTIONAL - (default 0.75) A strength parameter
+-- will make the advection eularian (with values interpolating in between). A
+-- value of 1 (which implements the update from An Unconditionally Stable
+-- MaCormack Method) tends to add too much high-frequency detail (especially
+-- when using Manta's maccormack implementation).
 -- @param boundaryWidth - OPTIONAL - boundary width. (default 1)
-local function advectScalar(dt, s, U, flags, method, sDst, boundaryWidth)
-  method = method or "maccormack"
+local function advectScalar(dt, s, U, flags, method, sDst,
+                            sampleOutsideFluid, maccormackStrength,
+                            boundaryWidth)
+  method = method or "maccormackOurs"
   boundaryWidth = boundaryWidth or 1
+  if sampleOutsideFluid == nil then
+    sampleOutsideFluid = false
+  end
+  maccormackStrength = maccormackStrength or 0.75
 
   -- Check arguments here (it's easier from lua).
   assert(s:dim() == 5 and U:dim() == 5 and flags:dim() == 5,
@@ -105,24 +124,27 @@ local function advectScalar(dt, s, U, flags, method, sDst, boundaryWidth)
   -- we should just allocate always since it makes the C++ logic easier. If
   -- might also need temporary storage if the user wants to do advection
   -- in-place.
+  local tmpSizes = {{bsz, 1, d, h, w}, {bsz, 1, d, h, w},
+                    {bsz, U:size(2), d, h, w}, {bsz, U:size(2), d, h, w}}
   if sDst == nil then
-    tmp = getTempStorage(s:type(), {{bsz, 1, d, h, w},
-                                    {bsz, 1, d, h, w},
-                                    {bsz, 1, d, h, w}})
+    tmpSizes[5] = {bsz, 1, d, h, w}
   else
-    tmp = getTempStorage(s:type(), {{bsz, 1, d, h, w}, {bsz, 1, d, h, w}})
     assert(sDst:dim() == 5, 'Size mismatch')
     assert(sDst:isContiguous(), 'Input is not contiguous')
     assert(sDst:isSameSizeAs(s), 'Size mismatch')
   end
-  local fwd = tmp[1]
+  tmp = getTempStorage(s:type(), tmpSizes)
+  local fwd = tmp[1]   -- For method == maccormack or maccormackOurs
   local bwd = tmp[2]
+  local fwdPos = tmp[3]  -- For method == maccormackOurs
+  local bwdPos = tmp[4]
 
   s.tfluids.advectScalar(dt, s, U, flags, fwd, bwd, is3D, method,
-                         boundaryWidth, sDst or tmp[3])
+                         fwdPos, bwdPos, boundaryWidth, sampleOutsideFluid,
+                         maccormackStrength, sDst or tmp[5])
   if sDst == nil then
     -- Copy the output scalar field back to the input.
-    s:copy(tmp[3])
+    s:copy(tmp[5])
   end
 end
 rawset(tfluids, 'advectScalar', advectScalar)
@@ -132,13 +154,24 @@ rawset(tfluids, 'advectScalar', advectScalar)
 -- @param dt - timestep (seconds).
 -- @param U - input vel field (size(2) can be 2 or 3, indicating 2D / 3D)
 -- @param flags - input occupancy grid
--- @param method - OPTIONAL - "euler", "maccormack" (default).
+-- @param method - OPTIONAL - "euler", "eulerOurs", "maccormack",
+-- "maccormackOurs" (default). A value of "rk2Ours" and "rk3Ours" will use
+-- maccormackOurs instead (they are left as placeholder options).
+-- better handle boundary conditions. You can use the Manta implementations if
+-- you find ours are too slow.
 -- @param UDst - OPTIONAL - If non-nil then this will be the returned
 -- velocity field. Otherwise advection will be performed in-place.
+-- @param maccormackStrength - OPTIONAL - (default 0.75) A strength parameter
+-- will make the advection more 1st ordre (with values interpolating in
+-- between). A value of 1 (which implements the update from "An Unconditionally
+-- Stable MaCormack Method") tends to add too much high-frequency detail
+-- (especially when using Manta's maccormack implementation).
 -- @param boundaryWidth - OPTIONAL - boundary width. (default 1)
-local function advectVel(dt, U, flags, method, UDst, boundaryWidth)
-  method = method or "maccormack"
-  boundaryWidth = boundaryWidth or 0
+local function advectVel(dt, U, flags, method, UDst, maccormackStrength,
+                         boundaryWidth)
+  method = method or "maccormackOurs"
+  boundaryWidth = boundaryWidth or 1
+  maccormackStrength = maccormackStrength or 0.75
 
   -- Check arguments here (it's easier from lua).
   assert(U:dim() == 5 and flags:dim() == 5, 'Dimension mismatch')
@@ -177,7 +210,7 @@ local function advectVel(dt, U, flags, method, UDst, boundaryWidth)
   local bwd = tmp[2]
 
   U.tfluids.advectVel(dt, U, flags, fwd, bwd, is3D, method,
-                      boundaryWidth, UDst or tmp[3])
+                      boundaryWidth, maccormackStrength, UDst or tmp[3])
 
   if UDst == nil then
     -- Copy the output velocity field back to the input.

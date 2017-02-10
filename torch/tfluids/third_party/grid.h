@@ -76,6 +76,14 @@ protected:
     return p_grid_[index5d(i, j, k, c, b)];
   }
 
+  real& data(const Int3& pos, int32_t c, int32_t b) {
+    return data(pos.x, pos.y, pos.z, c, b);
+  }
+
+  real data(const Int3& pos, int32_t c, int32_t b) const {
+    return data(pos.x, pos.y, pos.z, c, b);
+  }
+
   // the BUILD_INDEX macro in Manta's util/interpol.h.
   void buildIndex(int32_t& xi, int32_t& yi, int32_t& zi,
                   real& s0, real& t0, real& f0,
@@ -99,12 +107,24 @@ public:
     return static_cast<int>(data(i, j, k, 0, b)) & TypeFluid;
   }
 
+  bool isFluid(const Int3& pos, int32_t b) const {
+    return isFluid(pos.x, pos.y, pos.z, b);
+  }
+
+  bool isFluid(const tfluids_(vec3)& pos, int32_t b) const {
+    return isFluid((int32_t)pos.x, (int32_t)pos.y, (int32_t)pos.z, b);
+  }
+
   bool isObstacle(int32_t i, int32_t j, int32_t k, int32_t b) const {
     return static_cast<int>(data(i, j, k, 0, b)) & TypeObstacle;
   }
 
   bool isObstacle(const Int3& pos, int32_t b) const {
     return isObstacle(pos.x, pos.y, pos.z, b);
+  }
+
+  bool isObstacle(const tfluids_(vec3)& pos, int32_t b) const {
+    return isObstacle((int32_t)pos.x, (int32_t)pos.y, (int32_t)pos.z, b);
   }
 
   bool isStick(int32_t i, int32_t j, int32_t k, int32_t b) const {
@@ -117,6 +137,11 @@ public:
 
   bool isOutflow(int32_t i, int32_t j, int32_t k, int32_t b) const {
     return static_cast<int>(data(i, j, k, 0, b)) & TypeOutflow;
+  }
+
+  bool isOutOfDomain(int32_t i, int32_t j, int32_t k, int32_t b) const {
+    return (i < 0 || i >= xsize() || j < 0 || j >= ysize() || k < 0 ||
+            k >= zsize() || b < 0 || b >= nbatch());
   }
 };
 
@@ -135,8 +160,23 @@ public:
 
   real getInterpolatedHi(const tfluids_(vec3)& pos, int32_t order,
                          int32_t b) const;
+  real getInterpolatedWithFluidHi(const tfluids_(FlagGrid)& flag,
+                                  const tfluids_(vec3)& pos, int32_t order,
+                                  int32_t b) const;
 
   real interpol(const tfluids_(vec3)& pos, int32_t b) const;
+  real interpolWithFluid(const tfluids_(FlagGrid)& flag,
+                         const tfluids_(vec3)& pos, int32_t b) const;
+private:
+  // Interpol1DWithFluid will return:
+  // 1. is_fluid = false if a and b are not fluid.
+  // 2. is_fluid = true and data(a) if b is not fluid.
+  // 3. is_fluid = true and data(b) if a is not fluid.
+  // 4. The linear interpolation between data(a) and data(b) if both are fluid.
+  static void interpol1DWithFluid(const real val_a, const bool is_fluid_a,
+                                  const real val_b, const bool is_fluid_b,
+                                  const real t_a, const real t_b,
+                                  bool* is_fluid_ab, real* val_ab);
 };
 
 class tfluids_(MACGrid) : public tfluids_(GridBase) {
@@ -147,6 +187,10 @@ public:
   // not call this method on the edge of the simulation domain.
   const tfluids_(vec3) getCentered(int32_t i, int32_t j, int32_t k,
                                    int32_t b) const;
+  
+  const tfluids_(vec3) getCentered(const tfluids_(vec3) vec, int32_t b) {
+    return getCentered((int32_t)vec.x, (int32_t)vec.y, (int32_t)vec.z, b);
+  }
 
   const tfluids_(vec3) operator()(int32_t i, int32_t j,
                                   int32_t k, int32_t b) const {
@@ -202,9 +246,13 @@ public:
   }
 
   // setSafe will ignore the 3rd component of the input vector if the
-  // VecGrid is 2D.
+  // VecGrid is 2D, but check that it is non-zero.
   void setSafe(int32_t i, int32_t j, int32_t k, int32_t b,
                const tfluids_(vec3)& val);
+  // set will ignore the 3rd component of the input vector if the VecGrid is 2D
+  // and it will NOT check that the component is non-zero.
+  void set(int32_t i, int32_t j, int32_t k, int32_t b,
+           const tfluids_(vec3)& val);
 
   // Note: you CANNOT call curl on the border of the grid (if you do then
   // the data(...) calls will throw an error.

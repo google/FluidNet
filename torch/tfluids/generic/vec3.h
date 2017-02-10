@@ -89,6 +89,14 @@ struct tfluids_(vec3) {
     return ret;
   }
 
+  const tfluids_(vec3) operator/(const real rhs) const {  // mult scalar
+    tfluids_(vec3) ret = *this;
+    ret.x /= rhs;
+    ret.y /= rhs;
+    ret.z /= rhs;
+    return ret;
+  }
+
   inline real& operator()(int32_t i) {
     switch (i) {
     case 0:

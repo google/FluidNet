@@ -27,7 +27,9 @@
 // This type is common to both float and double implementations and so has
 // to be defined outside tfluids.cc.
 #include "generic/int3.cu.h"
+#include "generic/advect_type.h"
 
+// Some common functions
 inline int32_t clamp(const int32_t x, const int32_t low, const int32_t high) {
   return std::max<int32_t>(std::min<int32_t>(x, high), low);
 }

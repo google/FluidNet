@@ -26,6 +26,7 @@
 #include "THCDeviceUtils.cuh"
 #include "THCReduceApplyUtils.cuh"
 
+#include "generic/advect_type.h"
 #include "third_party/cell_type.h"
 #include "third_party/grid.cu.h"
 #include "generic/int3.cu.h"
@@ -40,6 +41,8 @@
 #define SOURCE_FILE "third_party/grid.h"
 #include "generic/cc_types.h"
 #undef SOURCE_FILE
+
+#include "generic/calc_line_trace.cu"
 
 const int threads_per_block = 512;  // Might need 256 for old SM.
 const int64_t cuda_num_threads = 1024;  // Might need 256 for old SM.

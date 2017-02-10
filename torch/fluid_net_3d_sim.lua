@@ -40,6 +40,7 @@ conf.batchSize = 1
 conf.loadModel = true
 conf.visualizeData = true
 conf.saveData = true
+conf.densityFilename = ''  -- empty string ==> use default path.
 conf.plumeSimMethod = 'convnet'  -- options are: 'convnet', 'jacobi', 'pcg'
 conf = torch.parseArgs(conf)  -- Overwrite conf params from the command line.
 assert(conf.batchSize == 1, 'The batch size must be one')
@@ -57,8 +58,6 @@ model:cuda()
 print('==> Loaded model from: ' .. conf.modelDirname)
 torch.setDropoutTrain(model, false)
 assert(mconf.is3D, 'The model must be 3D')
-print('    mconf:')
-print(torch.tableToString(mconf))
 
 -- *************************** Define some variables ***************************
 local res = 128
@@ -72,13 +71,18 @@ local batchCPU = {
 print("running simulation at resolution " .. res .. "^3")
 
 -- **************** Set some nice looking simulation variables  ****************
-mconf.vortictyConfinementAmp = 0.0
 mconf.buoyancyScale = 2.0
 mconf.dt = 0.1
 local plumeScale = 1.0
 local numFrames = 768
 local outputDecimation = 3
-mconf.advectionMethod = 'maccormack'  -- options are 'euler', 'maccormack'
+mconf.maccormackStrength = 0.8
+-- Option 1:
+mconf.vorticityConfinementAmp = 0
+mconf.advectionMethod = 'maccormackOurs'
+-- Option 2:
+-- mconf.vorticityConfinementAmp = tfluids.getDx(batchCPU.flags) * 4
+-- mconf.advectionMethod = 'rk2Ours'
 mconf.simMethod = conf.plumeSimMethod
 
 -- *************************** Load a model into flags *************************
@@ -129,6 +133,8 @@ print('Simulating with dt = ' .. mconf.dt)
 print('Saving every ' .. outputDecimation .. ' frames')
 print('Simulating for ' .. numFrames .. ' frames (' .. simulationTimeSec ..
       'sec)')
+print('    mconf:')
+print(torch.tableToString(mconf))
 
 -- ****************************** DATA FUNCTIONS *******************************
 -- Set up a plume boundary condition.
@@ -139,8 +145,12 @@ tfluids.createPlumeBCs(batchGPU, densityVal, plumeScale, rad)
 -- ***************************** Create Voxel File ****************************
 local densityFile, densityFilename, obstaclesFile, obstaclesFilename
 if conf.saveData then
-  densityFilename = (outDir .. '/density_output_' .. conf.modelFilename ..
-                     '_dt' .. mconf.dt .. '.vbox')
+  if string.len(conf.densityFilename) < 1 then
+    densityFilename = (outDir .. '/density_output_' .. conf.modelFilename ..
+                       '_dt' .. mconf.dt .. '.vbox')
+  else
+    densityFilename = conf.densityFilename
+  end
   densityFile = torch.DiskFile(densityFilename,'w')
   densityFile:binary()
   densityFile:writeInt(res)
@@ -233,5 +243,10 @@ print('Processing time: ' .. (1000 * t / numFrames) .. ' ms per frame')
 if conf.saveData then
   densityFile:close()
   obstaclesFile:close()
+end
+
+-- Close the image in case we're running the script in a batch.
+if conf.visualizeData then
+  hImage:close()
 end
 

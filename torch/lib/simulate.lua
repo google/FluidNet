@@ -181,18 +181,22 @@ function tfluids.simulate(conf, mconf, batch, model, outputDiv)
 
   -- First advect all scalar fields (density, temperature, etc).
   if density ~= nil then
+    local sampleOutsideFluid = false
     if type(density) == 'table' then
       -- Density is multi-channel, i.e. for RGB densities in the 2D demo.
       for _, chan in pairs(density) do
-        tfluids.advectScalar(mconf.dt, chan, U, flags, mconf.advectionMethod)
+        tfluids.advectScalar(mconf.dt, chan, U, flags, mconf.advectionMethod,
+                             nil, sampleOutsideFluid, mconf.maccormackStrength)
       end
     else
-      tfluids.advectScalar(mconf.dt, density, U, flags, mconf.advectionMethod)
+      tfluids.advectScalar(mconf.dt, density, U, flags, mconf.advectionMethod,
+                           nil, sampleOutsideFluid, mconf.maccormackStrength)
     end
   end
 
   -- Now self-advect velocity (must be advected last).
-  tfluids.advectVel(mconf.dt, U, flags, mconf.advectionMethod)
+  tfluids.advectVel(mconf.dt, U, flags, mconf.advectionMethod, nil, 
+                    mconf.maccormackStrength)
 
   -- Set the manual boundary conditions.
   setConstVals(batch, p, U, flags, density)
@@ -238,6 +242,8 @@ function tfluids.simulate(conf, mconf, batch, model, outputDiv)
     p:copy(pPred)
     U:copy(UPred)
   else
+    -- tfluids.setWallBcsForward(U, flags)
+
     -- Calculate the RHS of the linear system (divergence).
     batch.div = batch.div or p:clone()
     batch.div:typeAs(U):resizeAs(p)
@@ -262,6 +268,8 @@ function tfluids.simulate(conf, mconf, batch, model, outputDiv)
 
     -- Now update velocity (using the pressure gradient).
     tfluids.velocityUpdateForward(U, flags, p)
+
+    -- tfluids.setWallBcsForward(U, flags)
   end
 
   -- Set the constant domain values.

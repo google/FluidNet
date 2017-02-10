@@ -226,7 +226,7 @@ local function loadMantaBatch(fn)
   return p, U, flags, density, is3D
 end
 
-function test.advect()
+function test.advectManta()
   for dim = 2, 3 do
     -- Load the pre-advection Manta file for this test.
     local fn = dim .. 'd_initial.bin'
@@ -238,8 +238,14 @@ function test.advect()
     assert(is3D == (dim == 3))
 
     -- Now do advection using the 2 parameters and check against Manta.
-    for order = 1, 2 do
+    for _, method in pairs({'euler', 'maccormack'}) do
       -- Load the Manta ground truth.
+      local order
+      if method == 'euler' then
+        order = 1
+      else
+        order = 2
+      end
       local openStr = 'False'  -- It actually doesn't affect advection.
       fn = (dim .. 'd_advect_openBounds_' .. openStr .. '_order_' .. order ..
             '.bin')
@@ -253,56 +259,91 @@ function test.advect()
       -- Perform our own advection.
       local dt = 0.1  -- Unfortunately hard coded for now.
       local boundaryWidth = 0  -- Also shouldn't be hard coded.
-      local method
-      if order == 1 then
-        method = 'euler'
-      else
-        method = 'maccormack'
-      end
+      local maccormackStrength = 1.0
 
-      local nameS = ('tfluids.advectScalar dim ' .. dim .. ', order ' ..
-                    order)
-      local nameU = ('tfluids.advectVel dim ' .. dim .. ', order ' ..
-                    order)
+      local nameS = ('tfluids.advectScalar dim ' .. dim .. ', method ' ..
+                     method)
+      local nameU = ('tfluids.advectVel dim ' .. dim .. ', method ' .. method)
 
       -- Note: the clone's here are to make sure every inner loops
       -- sees completely independent data.
       local densityAdv =
           torch.rand(unpack(density:size():totable())):typeAs(density)
       tfluids.advectScalar(dt, density:clone(), U:clone(), flags:clone(),
-                           method, densityAdv, boundaryWidth)
+                           method, densityAdv, nil, maccormackStrength,
+                           boundaryWidth)
       local err = densityManta - densityAdv
       mytester:assertlt(err:abs():max(), precision, 'Error: ' .. nameS)
 
       -- Also try an in-place scalar advection.
       densityAdv = density:clone()
       tfluids.advectScalar(dt, densityAdv, U:clone(), flags:clone(),
-                           method, nil, boundaryWidth)
+                           method, nil, nil, maccormackStrength, boundaryWidth)
       local err = densityManta - densityAdv
       mytester:assertlt(err:abs():max(), precision, 'Error: ' .. nameS)
 
       local UAdv =
           torch.rand(unpack(U:size():totable())):typeAs(U)
       tfluids.advectVel(dt, U:clone(), flags:clone(), method, UAdv,
-                        boundaryWidth)
+                        maccormackStrength, boundaryWidth)
       err = UManta - UAdv
       mytester:assertlt(err:abs():max(), precision, 'Error: ' .. nameU)
 
       -- Also try an in-place velocity advection.
       local UAdv = U:clone()
       tfluids.advectVel(dt, UAdv, flags:clone(), method, nil, 
-                        boundaryWidth)
+                        maccormackStrength, boundaryWidth)
       err = UManta - UAdv
       mytester:assertlt(err:abs():max(), precision, 'Error: ' .. nameU)
 
       -- Now test and profile the CUDA version.
       profileAndTestCuda(tfluids.advectScalar, nameS,
                          {dt, density, U, flags,
-                          method, densityAdv, boundaryWidth}, {6})
+                          method, densityAdv, nil, maccormackStrength,
+                          boundaryWidth}, {6})
 
       profileAndTestCuda(tfluids.advectVel, nameU,
                          {dt, U, flags, method, U:clone():fill(0),
-                          boundaryWidth}, {5})
+                          maccormackStrength, boundaryWidth}, {5})
+    end
+  end  -- for dim
+end
+
+function test.advectOurs()
+  for dim = 2, 3 do
+    -- Now do advection using the 2 parameters and check against Manta.
+    for _, method in pairs({'eulerOurs', 'maccormackOurs', 'rk2Ours',
+                            'rk3Ours'}) do
+      for sampleOutsideFluid = 0, 1 do
+        local fn = dim .. 'd_initial.bin'
+        local _, U, flags, density, is3D = loadMantaBatch(fn)
+        assertNotAllEqual(U)
+        assertNotAllEqual(flags)
+        assertNotAllEqual(density)
+        assert(is3D == (dim == 3))
+
+        local dt = 0.1
+        local boundaryWidth = 0
+        local maccormackStrength = torch.uniform()  -- in [0, 1]
+
+        local nameS = ('advectScalar dim ' .. dim .. ', method ' ..
+                       method .. ', sampleOutFluid ' .. sampleOutsideFluid)
+        local nameU = ('advectVel dim ' .. dim .. ', method ' ..
+                       method .. ', sampleOutFluid ' .. sampleOutsideFluid)
+
+        -- We don't have GT for the non-manta implementations. Just compare
+        -- CPU and GPU implementations for consistency.
+        local densityAdv = density:clone():uniform()
+        profileAndTestCuda(tfluids.advectScalar, nameS,
+                           {dt, density, U, flags, method, densityAdv,
+                            sampleOutsideFluid == 1, maccormackStrength,
+                            boundaryWidth}, {6})
+
+        local UAdv = U:clone():uniform()
+        profileAndTestCuda(tfluids.advectVel, nameU,
+                           {dt, U, flags, method, UAdv,
+                            maccormackStrength, boundaryWidth}, {5})
+      end
     end
   end
 end
@@ -355,14 +396,11 @@ end
 function test.setWallBcs()
   local function testSetWallBcs(dim, fnInput, fnOutput)
     local fn = dim .. 'd_' .. fnInput
-print(fn)  -- TEMP CODE
     local _, U, flags, _, is3D = loadMantaBatch(fn)
     assertNotAllEqual(U)
     assertNotAllEqual(flags)
 
     assert(is3D == (dim == 3))
-
-print(flags:size()) -- TEMP CODE
 
     -- Make sure they're not all fluid cells (i.e. that there is some obstacles
     -- in the sub-set) otherwise we're not testing anything.
@@ -374,8 +412,6 @@ print(flags:size()) -- TEMP CODE
     assert(is3D == (dim == 3))
     assert(torch.all(torch.eq(flags, flagsManta)), 'flags changed!')
 
-print('our own') -- TEMP CODE
-
     -- Perform our own setWallBcs
     local UOurs = U:clone()
     tfluids.setWallBcsForward(UOurs, flags)
@@ -383,23 +419,17 @@ print('our own') -- TEMP CODE
     mytester:assertlt(err:abs():max(), precision,
                       'Error: tfluids.setWallBcs dim ' .. dim)
 
-print('test module')  -- TEMP CODE
-
     -- Test the same forward function but in the module.
     local mod = createJacobianTestModel(tfluids.SetWallBcs(), flags):float()
     err = mod:forward(U) - UManta
     mytester:assertlt(err:abs():max(), precision,
                      'Error: tfluids.setWallBcs FPROP dim ' .. dim)
 
-print('BPROP')  -- TEMP CODE
-
     local _, UBprop, flagsBprop, _ = createJacobianTestData(nil, U, flags, nil)
     local mod = createJacobianTestModel(tfluids.SetWallBcs(), flagsBprop)
     err = jac.testJacobian(mod, UBprop)
     mytester:assertlt(math.abs(err), precision,
                       'Error: tfluids.setWallBcs BPROP dim ' .. dim)
-
-print('profile')  -- TEMP CODE
 
     -- Now test and profile the CUDA version.
     profileAndTestCuda(tfluids.setWallBcsForward,

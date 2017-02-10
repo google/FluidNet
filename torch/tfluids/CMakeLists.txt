@@ -61,9 +61,9 @@ ENDIF()
 SET(luasrc init.lua flags_to_occupancy.lua set_wall_bcs.lua test_tfluids.lua velocity_divergence.lua velocity_update.lua  volumetric_up_sampling_nearest.lua)
 
 if (WITH_CUDA)
-  SET(src init.cu generic/tfluids.cu generic/tfluids.cu.h)
+  SET(src init.cu generic/tfluids.cu generic/tfluids.cu.h generic/advect_type.cc)
 ELSE()
-  SET(src init.cu)
+  SET(src init.cu generic/advect_type.cc)
 ENDIF()
 
 ADD_TORCH_PACKAGE(tfluids "${src}" "${luasrc}" "Torch Fluids utility lib.")

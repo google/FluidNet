@@ -1,2 +1,4 @@
 *.mexa64
+FindExternalVoxels.m
+VoxelPlotter.m
 *~

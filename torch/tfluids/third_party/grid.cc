@@ -162,6 +162,23 @@ real tfluids_(RealGrid)::getInterpolatedHi(const tfluids_(vec3)& pos,
   return 0;
 }
 
+real tfluids_(RealGrid)::getInterpolatedWithFluidHi(
+    const tfluids_(FlagGrid)& flags, const tfluids_(vec3)& pos,
+    int32_t order, int32_t b) const {
+  switch (order) {
+  case 1:
+    return interpolWithFluid(flags, pos, b);
+  case 2:
+    THError("getInterpolatedWithFluidHi ERROR: cubic not supported.");
+    // TODO(tompson): implement this.
+    break;
+  default:
+    THError("getInterpolatedWithFluidHi ERROR: order not supported.");
+    break;
+  }
+  return 0;
+}
+
 real tfluids_(RealGrid)::interpol(const tfluids_(vec3)& pos, int32_t b) const {
   int32_t xi, yi, zi;
   real s0, t0, f0, s1, t1, f1;
@@ -177,10 +194,140 @@ real tfluids_(RealGrid)::interpol(const tfluids_(vec3)& pos, int32_t b) const {
         + (data(xi + 1, yi, zi + 1, 0, b) * t0 +
            data(xi + 1, yi + 1, zi + 1, 0, b) * t1) * s1) * f1;
   } else {
-     return ((data(xi, yi, 0, 0, b) * t0 +
-              data(xi, yi + 1, 0, 0, b) * t1) * s0
-        + (data(xi + 1, yi, 0, 0, b) * t0 +
-           data(xi + 1, yi + 1, 0, 0, b) * t1) * s1);
+    return ((data(xi, yi, 0, 0, b) * t0 +
+             data(xi, yi + 1, 0, 0, b) * t1) * s0
+       + (data(xi + 1, yi, 0, 0, b) * t0 +
+          data(xi + 1, yi + 1, 0, 0, b) * t1) * s1);
+  }
+}
+
+void tfluids_(RealGrid)::interpol1DWithFluid(
+    const real val_a, const bool is_fluid_a,
+    const real val_b, const bool is_fluid_b,
+    const real t_a, const real t_b,
+    bool* is_fluid_ab, real* val_ab) {
+  if (!is_fluid_a && !is_fluid_b) {
+    *val_ab = (real)0;
+    *is_fluid_ab = false;
+  } else if (!is_fluid_a) {
+    *val_ab = val_b;
+    *is_fluid_ab = true;
+  } else if (!is_fluid_b) {
+    *val_ab = val_a;
+    *is_fluid_ab = true;
+  } else {
+    *val_ab = val_a * t_a + val_b * t_b;
+    *is_fluid_ab = true;
+  }
+}
+
+real tfluids_(RealGrid)::interpolWithFluid(
+    const tfluids_(FlagGrid)& flags, const tfluids_(vec3)& pos,
+    int32_t ibatch) const {
+  int32_t xi, yi, zi;
+  real s0, t0, f0, s1, t1, f1;
+  buildIndex(xi, yi, zi, s0, t0, f0, s1, t1, f1, pos);
+
+  if (is_3d()) {
+    // val_ab = data(xi, yi, zi, 0, b) * t0 +
+    //          data(xi, yi + 1, zi, 0, b) * t1
+    const Int3 p_a(xi, yi, zi);
+    const Int3 p_b(xi, yi + 1, zi);
+    bool is_fluid_ab;
+    real val_ab;
+    interpol1DWithFluid(data(p_a, 0, ibatch), flags.isFluid(p_a, ibatch),
+                        data(p_b, 0, ibatch), flags.isFluid(p_b, ibatch),
+                        t0, t1, &is_fluid_ab, &val_ab);
+
+    // val_cd = data(xi + 1, yi, zi, 0, b) * t0 +
+    //          data(xi + 1, yi + 1, zi, 0, b) * t1
+    const Int3 p_c(xi + 1, yi, zi);
+    const Int3 p_d(xi + 1, yi + 1, zi);
+    bool is_fluid_cd;
+    real val_cd;
+    interpol1DWithFluid(data(p_c, 0, ibatch), flags.isFluid(p_c, ibatch),
+                        data(p_d, 0, ibatch), flags.isFluid(p_d, ibatch),
+                        t0, t1, &is_fluid_cd, &val_cd);
+
+    // val_ef = data(xi, yi, zi + 1, 0, b) * t0 +
+    //          data(xi, yi + 1, zi + 1, 0, b) * t1
+    const Int3 p_e(xi, yi, zi + 1);
+    const Int3 p_f(xi, yi + 1, zi + 1);
+    bool is_fluid_ef;
+    real val_ef;
+    interpol1DWithFluid(data(p_e, 0, ibatch), flags.isFluid(p_e, ibatch),
+                        data(p_f, 0, ibatch), flags.isFluid(p_f, ibatch),
+                        t0, t1, &is_fluid_ef, &val_ef);
+
+    // val_gh = data(xi + 1, yi, zi + 1, 0, b) * t0 +
+    //          data(xi + 1, yi + 1, zi + 1, 0, b) * t1
+    const Int3 p_g(xi + 1, yi, zi + 1);
+    const Int3 p_h(xi + 1, yi + 1, zi + 1);
+    bool is_fluid_gh;
+    real val_gh;
+    interpol1DWithFluid(data(p_g, 0, ibatch), flags.isFluid(p_g, ibatch),
+                        data(p_h, 0, ibatch), flags.isFluid(p_h, ibatch),
+                        t0, t1, &is_fluid_gh, &val_gh);
+
+    // val_abcd = val_ab * s0 + val_cd * s1
+    bool is_fluid_abcd;
+    real val_abcd;
+    interpol1DWithFluid(val_ab, is_fluid_ab, val_cd, is_fluid_cd,
+                        s0, s1, &is_fluid_abcd, &val_abcd);
+
+    // val_efgh = val_ef * s0 + val_gh * s1
+    bool is_fluid_efgh;
+    real val_efgh;
+    interpol1DWithFluid(val_ef, is_fluid_ef, val_gh, is_fluid_gh,
+                        s0, s1, &is_fluid_efgh, &val_efgh);
+
+    // val = val_abcd * f0 + val_efgh * f1
+    bool is_fluid;
+    real val;
+    interpol1DWithFluid(val_abcd, is_fluid_abcd, val_efgh, is_fluid_efgh,
+                        f0, f1, &is_fluid, &val);
+    
+    if (!is_fluid) {
+      // None of the 8 cells were fluid. Just return the regular interp
+      // of all cells.
+      return interpol(pos, ibatch);
+    } else {
+      return val;
+    }
+  } else {
+    // val_ab = data(xi, yi, 0, 0, b) * t0 +
+    //          data(xi, yi + 1, 0, 0, b) * t1
+    const Int3 p_a(xi, yi, 0);
+    const Int3 p_b(xi, yi + 1, 0);
+    bool is_fluid_ab;
+    real val_ab;
+    interpol1DWithFluid(data(p_a, 0, ibatch), flags.isFluid(p_a, ibatch),
+                        data(p_b, 0, ibatch), flags.isFluid(p_b, ibatch),
+                        t0, t1, &is_fluid_ab, &val_ab);
+
+    // val_cd = data(xi + 1, yi, 0, 0, b) * t0 +
+    //          data(xi + 1, yi + 1, 0, 0, b) * t1
+    const Int3 p_c(xi + 1, yi, 0);
+    const Int3 p_d(xi + 1, yi + 1, 0);
+    bool is_fluid_cd;
+    real val_cd;
+    interpol1DWithFluid(data(p_c, 0, ibatch), flags.isFluid(p_c, ibatch),
+                        data(p_d, 0, ibatch), flags.isFluid(p_d, ibatch),
+                        t0, t1, &is_fluid_cd, &val_cd);
+
+    // val = val_ab * s0 + val_cd * s1
+    bool is_fluid;
+    real val;
+    interpol1DWithFluid(val_ab, is_fluid_ab, val_cd, is_fluid_cd,
+                        s0, s1, &is_fluid, &val);
+
+    if (!is_fluid) {
+      // None of the 4 cells were fluid. Just return the regular interp
+      // of all cells.
+      return interpol(pos, ibatch);
+    } else {
+      return val;
+    }
   }
 }
 
@@ -208,8 +355,6 @@ const tfluids_(vec3) tfluids_(MACGrid)::getCentered(
   return tfluids_(vec3)(x, y, z);
 }
 
-// setSafe will ignore the 3rd component of the input vector if the
-// MACGrid is 2D.
 void tfluids_(MACGrid)::setSafe(int32_t i, int32_t j, int32_t k, int32_t b,
                                 const tfluids_(vec3)& val) {
   data(i, j, k, 0, b) = val.x;
@@ -320,8 +465,6 @@ tfluids_(VecGrid)::tfluids_(VecGrid)(THTensor* grid, bool is_3d) :
   }
 }
 
-// setSafe will ignore the 3rd component of the input vector if the
-// VecGrid is 2D.
 void tfluids_(VecGrid)::setSafe(int32_t i, int32_t j, int32_t k, int32_t b,
                                 const tfluids_(vec3)& val) {
   data(i, j, k, 0, b) = val.x;
@@ -335,6 +478,15 @@ void tfluids_(VecGrid)::setSafe(int32_t i, int32_t j, int32_t k, int32_t b,
     if (val.z != 0) {
       THError("VecGrid: setSafe z-component is non-zero for a 2D grid.");
     }
+  }
+}
+
+void tfluids_(VecGrid)::set(int32_t i, int32_t j, int32_t k, int32_t b,
+                            const tfluids_(vec3)& val) {
+  data(i, j, k, 0, b) = val.x;
+  data(i, j, k, 1, b) = val.y;
+  if (is_3d()) {
+    data(i, j, k, 2, b) = val.z;
   }
 }
 
