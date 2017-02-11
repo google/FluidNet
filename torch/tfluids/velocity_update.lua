@@ -65,6 +65,7 @@ function VelocityUpdate:type(type)
   parent.type(self, type)
   self.gradInput[1] = self.gradInput[1]:type(type)
   self.gradInput[2] = self.gradInput[2]:type(type)
+  self.gradInput[3] = self.gradInput[3]:type(type)
   return self
 end
 
@@ -73,6 +74,7 @@ function VelocityUpdate:clearState()
   self.output:set()
   self.gradInput[1]:set()
   self.gradInput[2]:set()
+  self.gradInput[3]:set()
   return self
 end
 

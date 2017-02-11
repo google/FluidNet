@@ -55,12 +55,11 @@ print(cutorch.getDeviceProperties(conf.gpu))
 conf.modelDirname = conf.modelDir .. '/' .. conf.modelFilename
 local mconf, model = torch.loadModel(conf.modelDirname)
 model:cuda()
-print('==> Loaded model from: ' .. conf.modelDirname)
 torch.setDropoutTrain(model, false)
 assert(mconf.is3D, 'The model must be 3D')
 
 -- *************************** Define some variables ***************************
-local res = 128
+local res = 128  -- Choose power of 2 from 16 to 512.
 local batchCPU = {
     pDiv = torch.FloatTensor(conf.batchSize, 1, res, res, res):fill(0),
     UDiv = torch.FloatTensor(conf.batchSize, 3, res, res, res):fill(0),
@@ -71,43 +70,53 @@ local batchCPU = {
 print("running simulation at resolution " .. res .. "^3")
 
 -- **************** Set some nice looking simulation variables  ****************
-mconf.buoyancyScale = 2.0
+mconf.buoyancyScale = 2.0 * (res / 128)  -- 1 is good for 'none', 2 otherwise.
+mconf.gravityScale = 0
 mconf.dt = 0.1
-local plumeScale = 1.0
+local plumeScale = 1.0 * (res / 128)
 local numFrames = 768
 local outputDecimation = 3
-mconf.maccormackStrength = 0.8
+mconf.maccormackStrength = 0.6
+mconf.maxIter = 34  -- For jacobi or pcg only (34 matches our model at 128).
 -- Option 1:
-mconf.vorticityConfinementAmp = 0
+mconf.vorticityConfinementAmp = 3  -- Comparison videos rendered with 0
 mconf.advectionMethod = 'maccormackOurs'
 -- Option 2:
--- mconf.vorticityConfinementAmp = tfluids.getDx(batchCPU.flags) * 4
--- mconf.advectionMethod = 'rk2Ours'
+-- mconf.vorticityConfinementAmp = 2
+-- mconf.advectionMethod = 'eulerOurs'
 mconf.simMethod = conf.plumeSimMethod
 
 -- *************************** Load a model into flags *************************
 local voxels = {}
 local outDir
 if conf.loadVoxelModel ~= "none" then
-  if conf.loadVoxelModel == "arc" then
-    voxels = tfluids.loadVoxelData('../voxelizer/voxels_demo/Y91_arc_64.binvox')
+  -- We want the model resolution to be HALF the grid resolution.
+  local modelRes = math.pow(2, math.floor(math.log(res) / math.log(2)) - 1)
+  local offsetX = 0
+  local offsetY = 0
+  local offsetZ = 0
+  print('Using model resolution: ' .. modelRes)
+  if conf.loadVoxelModel == "arch" then
+    voxels = tfluids.loadVoxelData('../voxelizer/voxels_demo/Y91_arc_' ..
+                                   modelRes .. '.binvox')
     --This lines up the arc correctly
     tfluids.flipDiagonal(voxels.data, 2)
     tfluids.flipDiagonal(voxels.data, 0)
     outDir = '../blender/arch_render/'
+    offsetY = -0.04 * res
   elseif conf.loadVoxelModel == "bunny" then
     voxels = tfluids.loadVoxelData(
-      '../voxelizer/voxels_demo/bunny.capped_64.binvox')
+      '../voxelizer/voxels_demo/bunny.capped_' .. modelRes .. '.binvox')
+    tfluids.flipDiagonal(voxels.data, 2)
+    tfluids.flipDiagonal(voxels.data, 0)
     outDir = '../blender/bunny_render/'
+    offsetX = 0.04 * res  -- The center of the base is not center of BBOX.
+    offsetZ = 0.04 * res
   else
     error('Bad conf.loadVoxelModel value')
   end
-  voxels.data = tfluids.expandVoxelsToDims(res, res, res, voxels.data)
-  tfluids.moveVoxelCentroidToCenter(voxels.data)
-  voxels.dims = {res, res, res}
-  local bb = tfluids.calculateBoundingBox(voxels.data)
-  voxels.min = bb.min
-  voxels.max = bb.max
+  voxels.data = tfluids.padVoxelsToDims(res, res, res, voxels.data,
+                                        offsetX, offsetY, offsetZ)
 
   -- We need to turn the occupancy grid {0, 1} into a proper flags grid.
   local occ = voxels.data:view(1, 1, res, res, res)
@@ -144,6 +153,7 @@ tfluids.createPlumeBCs(batchGPU, densityVal, plumeScale, rad)
 
 -- ***************************** Create Voxel File ****************************
 local densityFile, densityFilename, obstaclesFile, obstaclesFilename
+local obstaclesBlenderFile, obstaclesBlenderFilename
 if conf.saveData then
   if string.len(conf.densityFilename) < 1 then
     densityFilename = (outDir .. '/density_output_' .. conf.modelFilename ..
@@ -165,35 +175,88 @@ if conf.saveData then
   obstaclesFile:writeInt(res)
   obstaclesFile:writeInt(res)
   obstaclesFile:writeInt(1)
+
+  obstaclesBlenderFilename = (outDir .. '/geom_output_blender.vbox')
+  obstaclesBlenderFile = torch.DiskFile(obstaclesBlenderFilename,'w')
+  obstaclesBlenderFile:binary()
+  obstaclesBlenderFile:writeInt(res)
+  obstaclesBlenderFile:writeInt(res)
+  obstaclesBlenderFile:writeInt(res)
+  obstaclesBlenderFile:writeInt(1)
+
+  print('Writing density to: ' .. densityFilename)
+  print('Writing geom to: ' .. obstaclesFilename)
+  print('Writing blender geom to: ' .. obstaclesBlenderFilename)
 end
 
 local divNet = tfluids.VelocityDivergence():cuda()
 
-local hImage
-if conf.visualizeData then
-  local _, U, flags, _ = tfluids.getPUFlagsDensityReference(batchGPU)
-
+function visualizeData(batchGPU, hImage)
+  -- This is SUPER slow. We're pulling off the GPU and then sending it back
+  -- as an image.display call. It probably limits framerate.
+  local _, U, flags, density, _ = tfluids.getPUFlagsDensityReference(batchGPU)
   local div = divNet:forward({U, flags})
   div = div:squeeze():mean(1):squeeze()  -- Mean along z-channel.
+  local flags = flags:squeeze():mean(1):squeeze()
+  local density = density:mean(2):squeeze():sqrt()
+  local densityz = density:mean(1):squeeze()  -- Average along Z dimension.
+  local densityx = density:mean(3):squeeze():t():contiguous()
+  local sz = {1, 1, div:size(1), div:size(2)}
 
-  local density = batchGPU.density:mean(2):squeeze()
-  density = density:mean(1):squeeze()  -- Average along Z dimension.
+  flags = flags:view(unpack(sz)):float()
+  div = div:view(unpack(sz)):float()
+  densityx = densityx:view(unpack(sz)):float()
+  densityz = densityz:view(unpack(sz)):float()
+  local im = torch.cat({flags, div, densityz, densityx}, 1)
+  im = image.flip(im, 3)  -- Flip y dimension.
+  if hImage == nil then
+    hImage = image.display{image = im, zoom = 512 / density:size(1),
+                           gui = false, padding = 2, scaleeach = true, nrow = 2,
+                           legend = 'flags, div, density_z, density_x'}
+  else
+    image.display{image = im, zoom = 512 / density:size(1),
+                  gui = false, padding = 2, scaleeach = true, nrow = 2,
+                  legend = 'flags, div, density_z, density_x', win = hImage}
+  end
+  return hImage
+end
 
-  local sz = {1, div:size(1), div:size(2)}
-  local im = torch.cat(div:view(unpack(sz)), density:view(unpack(sz)), 1)
-  hImage = image.display{image = im, zoom = 512 / density:size(1),
-                         gui = false, legend = 'divergence & density',
-                         padding = 2}
+local hImage
+if conf.visualizeData then
+  hImage = visualizeData(batchGPU)
 end
 
 -- ***************************** SIMULATION LOOP *******************************
 local obstacles = batchGPU.flags:clone()
-sys.tic()
+local t0
+local msgAccum = 0
+tfluids.profilePressure = true  -- Enable profiling.
 for i = 1, numFrames do
+  local curFps, dt
+  if i == 2 then
+    t0 = sys.clock()  -- Don't include timing for the first frame.
+  end
+  if i > 2 then
+    dt = sys.clock() - t0
+    curFps = (i - 2) / dt
+  end
+
   if math.fmod(i, 20) == 0 then
     collectgarbage()
   end
-  print('Simulating frame ' .. i .. ' of ' .. numFrames)
+
+  if i <= 2 or (dt - msgAccum > 1) then
+    msgAccum = dt or 0
+    local msg = 'Simulating frame ' .. i .. ' of ' .. numFrames
+    if curFps ~= nil then
+      local sec = (numFrames - i) / curFps
+      local min = math.floor(sec / 60)
+      sec = sec - (min * 60)
+      msg = string.format('%s (est time remaining %d:%02d min:sec)',
+                          msg, min, sec)
+    end
+    print(msg)
+  end
   
   tfluids.simulate(conf, mconf, batchGPU, model, false)
   -- Result is now on the GPU.
@@ -201,44 +264,45 @@ for i = 1, numFrames do
   local p, U, flags, density = tfluids.getPUFlagsDensityReference(batchGPU)
 
   if conf.saveData then
-    -- Convert flags to obstacles array with 0, 1 for occupied.
-    -- The next call assumes that the domain is fluid everywhere else and that
-    -- there are no obstacle inflow regions.
-    tfluids.flagsToOccupancy(flags, obstacles)
-
     if i == 1 then
+      -- Convert flags to obstacles array with 0, 1 for occupied.
+      -- The next call assumes that the domain is fluid everywhere else and that
+      -- there are no obstacle inflow regions.
+      tfluids.flagsToOccupancy(flags, obstacles)
+
       obstaclesFile:writeFloat(
           obstacles:squeeze():permute(3, 2, 1):float():contiguous():storage())
-      print('  ==> Saved obstacles to ' .. obstaclesFilename)
+
+      -- Zero out the bnd obstacles (otherwise when we render it we wont be able
+      -- to see anything).
+      for dim = 3, 5 do
+        obstacles:select(dim, 1):fill(0)
+        obstacles:select(dim, res):fill(0)
+      end
+      obstaclesBlenderFile:writeFloat(
+          obstacles:squeeze():permute(3, 2, 1):float():contiguous():storage())
     end
+
     if math.fmod(i, outputDecimation) == 0 then
       -- Save greyscale density (so mean across RGB).
       densityFile:writeFloat(density:mean(2):squeeze():permute(
           3, 2, 1):float():contiguous():storage())
-      print('  ==> Saved density to ' .. densityFilename)
     end
   end
 
   if conf.visualizeData then
-    -- This is SUPER slow. We're pulling off the GPU and then sending it back
-    -- as an image.display call. It probably limits framerate.
-    local div = divNet:forward({U, flags})
-    div = div:squeeze():mean(1):squeeze()  -- Mean along z-channel.
-
-    local density = batchGPU.density:mean(2):squeeze()  -- Mean of RGB
-    density = density:mean(1):squeeze():sqrt()  -- Mean along z-channel.
-
-    local sz = {1, div:size(1), div:size(2)}
-    local im = torch.cat(div:view(unpack(sz)), density:view(unpack(sz)), 1)
-    image.display{image = im, zoom = 512 / density:size(1),
-                  gui = false, legend = 'divergence & density', win = hImage,
-                  padding = 2}
+    visualizeData(batchGPU, hImage)
   end
 end
 cutorch.synchronize()
-local t = sys.toc()
+local t1 = sys.clock()
 print('All done!')
-print('Processing time: ' .. (1000 * t / numFrames) .. ' ms per frame')
+print('Processing time: ' .. (1000 * (t1 - t0) / (numFrames - 1)) ..
+      ' ms per frame')
+print('Processing time linear projection: ' .. 
+      (1000 * tfluids.profilePressureTime / tfluids.profilePressureCount) ..
+      ' ms per frame')
+
 
 if conf.saveData then
   densityFile:close()

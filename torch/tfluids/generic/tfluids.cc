@@ -829,8 +829,94 @@ static int tfluids_(Main_solveLinearSystemPCG)(lua_State *L) {
   return 0;
 }
 
+// *****************************************************************************
+// solveLinearSystemJacobi
+// *****************************************************************************
+
 static int tfluids_(Main_solveLinearSystemJacobi)(lua_State *L) {
   luaL_error(L, "ERROR: solveLinearSystemJacobi not defined for CPU tensors.");
+  return 0;
+}
+
+// *****************************************************************************
+// normalizePressureMean
+// *****************************************************************************
+
+static int tfluids_(Main_normalizePressureMean)(lua_State *L) {
+  THTensor* p_tensor =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 1, torch_Tensor));
+  THTensor* flag_tensor =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 2, torch_Tensor));
+  const bool is_3d = static_cast<bool>(lua_toboolean(L, 3));
+  THIntTensor* inds_tensor = reinterpret_cast<THIntTensor*>(
+      luaT_checkudata(L, 4, "torch.IntTensor"));
+
+  tfluids_(FlagGrid) flags(flag_tensor, is_3d);
+  tfluids_(RealGrid) pressure(p_tensor, is_3d);
+
+  const int32_t xsize = flags.xsize();
+  const int32_t ysize = flags.ysize();
+  const int32_t zsize = flags.zsize();
+  const int32_t nbatch = flags.nbatch();
+
+  // The flood-fill portion is hard to parallelize, but we'll at least do it
+  // at the batch level.
+  THIntTensor_resize4d(inds_tensor, nbatch, zsize, ysize, xsize);
+  std::vector<std::vector<int32_t>> component_sizes;
+  component_sizes.resize(nbatch);
+
+  int32_t b;
+#pragma omp parallel for private(b)
+  for (b = 0; b < nbatch; b++) {
+    THIntTensor* inds = THIntTensor_newSelect(inds_tensor, 0, b);
+    findConnectedFluidComponents(flags, inds, b, &(component_sizes[b]));
+    THIntTensor_free(inds);  // Clean up the select.
+  }
+
+  THTensor* mean_tensor = THTensor_(new)();
+
+  int32_t z, y, x; 
+  for (b = 0; b < nbatch; b++) {
+    // Now calculate the component means.
+    const int32_t ncomponents = component_sizes[b].size();
+    THTensor_(resize1d)(mean_tensor, ncomponents);
+    THTensor_(fill)(mean_tensor, (real)0);
+    real* mean = THTensor_(data)(mean_tensor);
+#pragma omp parallel for private(z, y, x) collapse(3)
+    for (z = 0; z < zsize; z++) {
+      for (y = 0; y < ysize; y++) {
+        for (x = 0; x < xsize; x++) {
+          const int32_t cur_component = THIntTensor_get4d(
+              inds_tensor, b, z, y, x);
+          // component of -1 is a non-fluid cell.
+          if (cur_component >= 0) {
+#pragma omp atomic
+            mean[cur_component] += pressure(x, y, z, b);
+          }
+        }
+      }
+    }
+    for (int32_t c = 0; c < ncomponents; c++) {
+      mean[c] = mean[c] / static_cast<real>(component_sizes[b][c]);
+    }
+
+    // Now subtract the component means.
+#pragma omp parallel for private(z, y, x) collapse(3)
+    for (z = 0; z < zsize; z++) {
+      for (y = 0; y < ysize; y++) {
+        for (x = 0; x < xsize; x++) {
+          const int32_t cur_component = THIntTensor_get4d(
+              inds_tensor, b, z, y, x);
+          if (cur_component >= 0) {
+            pressure(x, y, z, b) = pressure(x, y, z, b) - mean[cur_component];
+          }
+        }
+      }
+    }
+  }
+
+  THTensor_(free)(mean_tensor);
+
   return 0;
 }
 
@@ -844,6 +930,7 @@ static const struct luaL_Reg tfluids_(Main__) [] = {
   {"setWallBcsForward", tfluids_(Main_setWallBcsForward)},
   {"vorticityConfinement", tfluids_(Main_vorticityConfinement)},
   {"addBuoyancy", tfluids_(Main_addBuoyancy)},
+  {"addGravity", tfluids_(Main_addGravity)},
   {"drawVelocityField", tfluids_(Main_drawVelocityField)},
   {"loadTensorTexture", tfluids_(Main_loadTensorTexture)},
   {"velocityUpdateForward", tfluids_(Main_velocityUpdateForward)},
@@ -858,6 +945,7 @@ static const struct luaL_Reg tfluids_(Main__) [] = {
   {"volumetricUpSamplingNearestBackward",
    tfluids_(Main_volumetricUpSamplingNearestBackward)},
   {"solveLinearSystemJacobi", tfluids_(Main_solveLinearSystemJacobi)},
+  {"normalizePressureMean", tfluids_(Main_normalizePressureMean)},
   {"rectangularBlur", tfluids_(Main_rectangularBlur)},
   {"signedDistanceField", tfluids_(Main_signedDistanceField)},
   {NULL, NULL}  // NOLINT

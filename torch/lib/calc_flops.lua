@@ -229,9 +229,13 @@ function torch.CalculateFlops(module, input, verbose, depth)
     peakMemory = 0
     if module.data.module ~= nil then
       assert(module.data.input ~= nil)
+      local curInput = module.data.input
+      local curModule = module.data.module
+      if #curInput == 1 then
+        curInput = curInput[1]
+      end
       flops, peakMemory =
-          torch.CalculateFlops(module.data.module, module.data.input[1],
-                               verbose, depth + 1)
+          torch.CalculateFlops(curModule, curInput, verbose, depth + 1)
     end
 
     local debugLabel = '<empty debug label>'
@@ -250,16 +254,23 @@ function torch.CalculateFlops(module, input, verbose, depth)
     -- we use the forwardNodes table to visit all nodes in the graph.
   elseif moduleType == 'tfluids.VelocityUpdate' then
     -- This is VERY rough (from a cursory glance at tfluids/generic/tfluids.cc).
-    flops = inputNumel * 10
-    peakMemory = inputNumel + outputNumel
+    local pNumel = calcSingleBatchNumel(input[1])
+    local flagsNumel = calcSingleBatchNumel(input[3])
+    local UNumel = calcSingleBatchNumel(input[2])
+    flops = flagsNumel + 2 * pNumel + UNumel
+    peakMemory = UNumel + flagsNumel + pNumel  -- Done in-place.
   elseif moduleType == 'tfluids.SetWallBcs' then
     -- This is VERY rough (from a cursory glance at tfluids/generic/tfluids.cc).
-    flops = inputNumel * 2
-    peakMemory = inputNumel + outputNumel
+    local flagsNumel = calcSingleBatchNumel(input[2])
+    local UNumel = calcSingleBatchNumel(input[1])
+    flops = flagsNumel * 2
+    peakMemory = flagsNumel + UNumel  -- Done in-place.
   elseif moduleType == 'tfluids.VelocityDivergence' then
+    local flagsNumel = calcSingleBatchNumel(input[2])
+    local UNumel = calcSingleBatchNumel(input[1])
     -- This is also VERY rough.
-    flops = inputNumel * 8
-    peakMemory = inputNumel + outputNumel
+    flops = flagsNumel * 8
+    peakMemory = flagsNumel * 2 + UNumel
   elseif moduleType == 'nn.StandardDeviation' then
     print('WARNING: Not estimating flops for nn.StandardDeviation')
     flops = 0
@@ -268,6 +279,8 @@ function torch.CalculateFlops(module, input, verbose, depth)
     flops = 2 * inputNumel
     peakMemory = inputNumel + outputNumel
   elseif moduleType == 'nn.ApplyScale' then
+    inputNumel = calcSingleBatchNumel(input[1])
+    outputNumel = inputNumel
     flops = 2 * inputNumel
     peakMemory = inputNumel + outputNumel
   elseif moduleType == 'tfluids.FlagsToOccupancy' then

@@ -800,7 +800,7 @@ end
 
 function torch.TensorToString(val)
   assert(torch.isTensor(val))
-  str = '[' .. torch.type(val) .. ' of size '
+  local str = '[' .. torch.type(val) .. ' of size '
   for i = 1, val:dim() do
     str = str .. val:size(i)
     if i < val:dim() then
@@ -837,8 +837,8 @@ function torch.SerializeTable(val, name, skipnewlines, skipname, depth)
       end
 
       for ikey = 1, #keys do
-          k = keys[ikey]
-          v = val[k]
+          local k = keys[ikey]
+          local v = val[k]
           tmp = (tmp ..
                  torch.SerializeTable(v, k, skipnewlines, skipname, depth + 1))
           if ikey < #keys then

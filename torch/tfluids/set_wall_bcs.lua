@@ -88,5 +88,6 @@ function SetWallBcs:clearState()
   for i = 1, #self.gradInput do
     self.gradInput[i] = self.gradInput[i]:type(torch.type(self.output))
   end
+  self.mask:set()
 end
 

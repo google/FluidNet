@@ -130,11 +130,62 @@ function torch.runEpoch(input)
     -- Sync the batch to the GPU.
     torch.syncBatchToGPU(batch.data, batchGPU)
 
+    local oldBuoyancyScale = mconf.buoyancyScale
+    if (torch.uniform() < mconf.trainBuoyancyProb) then
+      -- Add buoyancy to this batch.
+      mconf.buoyancyScale = mconf.trainBuoyancyScale
+    end
+
+    local oldGravityScale = mconf.gravityScale
+    if (torch.uniform() < mconf.trainGravityProb) then
+      -- Add gravity to this batch.
+      mconf.gravityScale = mconf.trainGravityScale  
+    end
+
+    local oldVorticityConfinementAmp = mconf.vorticityConfinementAmp
+    if (torch.uniform() < mconf.trainVorticityConfinementProb) then
+      -- Add vorticity confinement to this batch.
+      mconf.vorticityConfinementAmp = mconf.trainVorticityConfinementAmp
+    end
+
+    local oldGravity = mconf.gravity
+    if mconf.buoyancyScale > 0 or mconf.gravityScale > 0 then
+      mconf.gravity = torch.CudaTensor(3):fill(0)
+      -- Pick a random cardinal direction.
+      mconf.gravity[torch.random(1, 3)] = (torch.random(0, 1) * 2 - 1)
+      -- Use standard gravity direction.
+      -- mconf.gravity[2] = 1
+    end
+
+    if mconf.trainTrainSource ~= 'manta' and
+       (mconf.lossPLambda > 0 or mconf.lossULambda > 0) then
+      -- Since the ground truth data is no longer static, we can go
+      -- crazy with whatever data augmentation we want, including adding
+      -- additional gravity, buoyancy, vorticity confinement, random noise, etc.
+      tfluids.dataAugmentation(conf, mconf, batchGPU)
+
+      -- Calculate the ground truth P and U targets using our own Jacobi or
+      -- PCG solvers (rather than manta).
+      tfluids.calcPUTargets(conf, mconf, batchGPU, model)
+    end
+
+    if mconf.lossPLambda > 0 then
+      -- So each connected component of fluid cells in our linear system
+      -- solution can have an arbitrary pressure bias and still be correct.
+      -- Therefore we need to zero the mean of each of these pressure
+      -- connected components.
+      tfluids.normalizePressureMean(batchGPU.pTarget, batchGPU.flags,
+                                    mconf.is3D)
+    end
+
     -- The first batch is not representative of processing time, don't include
     -- it (this is because lots of mallocs happen on the first batch).
     if time == nil then
       time = sys.clock()
     end
+
+    -- TODO(tompson): We might want to add gravity and buoyancy to the current
+    -- frame.
 
     -- create closure to evaluate f(X) and df/dX
     local feval = function(x)
@@ -192,8 +243,9 @@ function torch.runEpoch(input)
         -- Pick a random timescale.
         if mconf.timeScaleSigma > 0 then
           -- note, randn() returns normal distribution with mean 0 and var 1.
-          local scale = 1 + math.abs(torch.randn(1)[1] *
-                                     mconf.timeScaleSigma)
+          -- the mean of abs(randn) ~= 0.7972, hence the 0.2028 value below.
+          local scale = 0.2028 + math.abs(torch.randn(1)[1] *
+                                          mconf.timeScaleSigma)
           mconf.dt = baseDt * scale
         end
 
@@ -205,6 +257,8 @@ function torch.runEpoch(input)
           numFutureSteps = mconf.longTermDivNumSteps[2]
         end
 
+        -- Set the simulation forward n steps, but on the last step do not
+        -- perform a pressure projection.
         for i = 1, numFutureSteps do
           local outputDiv = (i == numFutureSteps)
           tfluids.simulate(conf, mconf, batchGPU, model, outputDiv)
@@ -216,8 +270,18 @@ function torch.runEpoch(input)
 
         -- Now calculate the divergence error for this future frame.
         assert(torch.type(crit) == 'nn.FluidCriterion')
-        crit.pLambda = 0
-        crit.uLambda = 0
+        if (mconf.trainTargetSource == 'manta') then
+          -- We wont have any pressure or velocity GT for this future frame
+          -- from Manta, so we must set the lambda term to 0.
+          crit.pLambda = 0
+          crit.uLambda = 0
+        else
+          -- We'll need to calculate the GT for this future frame.
+          tfluids.calcPUTargets(conf, mconf, batchGPU, model)
+          tfluids.normalizePressureMean(batchGPU.pTarget, batchGPU.flags,
+                                        mconf.is3D)
+
+        end
         crit.divLambda = mconf.longTermDivLambda
         local errLongTermDiv = crit:forward(output, target)
         aveLongTermDivLoss = aveLongTermDivLoss + errLongTermDiv
@@ -229,14 +293,11 @@ function torch.runEpoch(input)
         model:backward(input, df_do)
 
         -- Put the criterion lambdas back.
-        -- TODO(tompson): This is a little ugly. Should we have a separate crit?
         crit.pLambda = mconf.lossPLambda
         crit.uLambda = mconf.lossULambda
         crit.divLambda = mconf.lossDivLambda
 
         -- Put the dt back.
-        -- TODO(tompson): Again this is ugly, it might be safer to deep clone
-        -- mconf.
         mconf.dt = baseDt
       end
 
@@ -261,6 +322,12 @@ function torch.runEpoch(input)
       -- Just execute the callback to FPROP.
       feval(parameters)
     end
+
+    -- Put the simulation parameters back.
+    mconf.buoyancyScale = oldBuoyancyScale
+    mconf.gravityScale = oldGravityScale
+    mconf.vorticityConfinementAmp = oldVorticityConfinementAmp
+    mconf.gravity = oldGravity
 
     nbatches = nbatches + 1
   until parallel:empty()

@@ -19,29 +19,33 @@ local tfluids = require('tfluids')
 
 function tfluids.calculateBoundingBox(voxels)
   assert(voxels:dim() == 3)
-  local dims = voxels:size()
-  local max = {1, 1, 1}
-  local min = dims
-
-  local count = 0
-  for z = 1, dims[3] do
-    for y = 1, dims[2] do
-      for x = 1, dims[1] do
-        if voxels[{x, y, z}] ~= 0 then
-          count = count + 1
-          if x < min[1] then min[1] = x end 
-          if x > max[1] then max[1] = x end 
-
-          if y < min[2] then min[2] = y end 
-          if y > max[2] then max[2] = y end 
-
-          if z < min[3] then min[3] = z end 
-          if z > max[3] then max[3] = z end 
-        end
+  local function firstLastNonzero(data)
+    assert(data:dim() == 1)
+    local first, last
+    for i = 1, data:size(1) do
+      if data[i] ~= 0 then
+        first = i
+        break
       end
     end
+    for i = data:size(1), 1, -1 do
+      if data[i] ~= 0 then
+        last = i
+        break
+      end
+    end
+    return first, last
   end
-  assert(count > 0) -- Make sure the volume wasn't empty.
+
+  -- Sum along x and y then find the first and last non-zero.
+  local zmin, zmax = firstLastNonzero(voxels:sum(1):sum(2):squeeze())
+  local ymin, ymax = firstLastNonzero(voxels:sum(1):sum(3):squeeze())
+  local xmin, xmax = firstLastNonzero(voxels:sum(2):sum(3):squeeze())
+ 
+  min = {xmin, ymin, zmin}
+  max = {xmax, ymax, zmax}
+
+  assert(voxels:sum() > 0) -- Make sure the volume wasn't empty.
   return {min=min, max=max}
 end
 
@@ -158,6 +162,7 @@ end
 
 
 function tfluids.moveVoxelBBoxToCenter(voxels)
+  print('  Moving voxel bounding box to center of domain')
   local bbox = tfluids.calculateBoundingBox(voxels)
   local dims = voxels:size()
   local sizes = {bbox.max[1] - bbox.min[1], bbox.max[2] - bbox.min[2],
@@ -168,13 +173,33 @@ function tfluids.moveVoxelBBoxToCenter(voxels)
   tfluids.translateVoxels(voxels, shift)
 end
 
-function tfluids.expandVoxelsToDims(width, height, depth, target)
-  assert(#target:size() == 3)
-  local dims = target:size()
-  assert(dims[1] <= depth and dims[2] <= height and dims[3] <= width)
-  local tmp = torch.FloatTensor(depth, height, width):fill(0)
-  tmp[{{1, dims[1]}, {1, dims[2]}, {1, dims[3]}}] = target
-  return tmp
+function tfluids.padVoxelsToDims(width, height, depth, voxels,
+                                 offsetX, offsetY, offsetZ)
+  print('  Padding voxels to dimension ' .. width .. ' ' .. height .. ' ' ..
+        depth)
+  assert(#voxels:size() == 3)
+  assert(voxels:size(1) <= depth and voxels:size(2) <= height and
+         voxels:size(3) <= width)
+
+  -- Trim the input voxels to the bounding box.
+  local bbox = tfluids.calculateBoundingBox(voxels)
+  voxels = voxels[{{bbox.min[1], bbox.max[1]},
+                   {bbox.min[2], bbox.max[2]},
+                   {bbox.min[3], bbox.max[3]}}]:contiguous()
+
+  -- Now create a new grid and paste the voxels in (with equal padding on both
+  -- sides).
+  local padLft = math.max(math.floor((width - voxels:size(3)) / 2 + offsetX), 1)
+  local padBot =
+      math.max(math.floor((height - voxels:size(2)) / 2 + offsetY), 1)
+  local padBck = math.max(math.floor((depth - voxels:size(1)) / 2 + offsetZ), 1)
+
+  local ret = torch.Tensor():typeAs(voxels):resize(depth, height, width):fill(0)
+  ret[{{padBck + 1, padBck + voxels:size(1)},
+       {padBot + 1, padBot + voxels:size(2)},
+       {padLft + 1, padLft + voxels:size(3)}}]:copy(voxels)
+  assert(ret:sum() == voxels:sum(), 'Lost some voxels.')
+  return ret
 end
 
 function tfluids.blitIntoTarget(src, target, offset)
@@ -198,6 +223,7 @@ end
 
 -- Used to be named: tfluids.rotateVoxels90
 function tfluids.flipDiagonal(voxels, axis)
+  print('  Flipping voxels along axis ' .. axis)
   local dims = voxels:size()
   assert(#dims == 3)
   assert(axis >=0 and axis <=2)
@@ -210,10 +236,18 @@ function tfluids.flipDiagonal(voxels, axis)
   end
 
   -- I have to use a copy.  I tried in place swaps and it didn't work
-  local tmp = torch.FloatTensor(dims[1], dims[2], dims[3]):fill(0)
-  for i = 1, dims[1] do
-    for j = 1, dims[2] do
-      for k = 1, dims[3] do
+  local tmp = torch.Tensor():typeAs(voxels)
+  local tmp = tmp:resize(dims[1], dims[2], dims[3]):fill(0)
+  local pTmp = tmp:data()
+  local pVoxels = voxels:data()
+  local idim = dims[1]
+  local jdim = dims[2]
+  local kdim = dims[3]
+  local jstride = kdim
+  local istride = kdim * jdim
+  for i = 1, idim do
+    for j = 1, jdim do
+      for k = 1, kdim do
           local ii = i
           local jj = j
           local kk = k
@@ -230,8 +264,12 @@ function tfluids.flipDiagonal(voxels, axis)
             jj = i
             kk = k
           end
-          tmp[{i, j, k}] = voxels[{ii, jj, kk}]
-          tmp[{ii, jj, kk}] = voxels[{i, j, k}]
+          local ind1 = (i - 1) * istride + (j - 1) * jstride + (k - 1)
+          local ind2 = (ii - 1) * istride + (jj - 1) * jstride + (kk - 1)
+          -- tmp[{i, j, k}] = voxels[{ii, jj, kk}]
+          -- tmp[{ii, jj, kk}] = voxels[{i, j, k}]
+          pTmp[ind1] = pVoxels[ind2]
+          pTmp[ind2] = pVoxels[ind1]
       end
     end
   end
