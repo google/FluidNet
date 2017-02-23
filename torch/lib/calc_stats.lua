@@ -12,8 +12,12 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
+-- This is really just a 'catch all' function for a bunch of hacky data and
+-- analysis (some of which was used for the paper).
+
 local sys = require('sys')
 local tfluids = require('tfluids')
+local image = torch.loadPackageSafe('image')
 
 -- Calculate divergence stats. 
 function torch.calcStats(input)
@@ -22,62 +26,38 @@ function torch.calcStats(input)
   local conf = input.conf
   local mconf = input.mconf
   local model = input.model
-  local nSteps = input.nSteps or 128
+  local nSteps = input.nSteps
 
   torch.setDropoutTrain(model, false)
-  local dataInds
-  if conf.maxSamplesPerEpoch < math.huge then
-    dataInds = torch.range(1,
-                           math.min(data:nsamples(), conf.maxSamplesPerEpoch))
-  else
-    dataInds = torch.range(1, data:nsamples())
-  end
 
-  local batchCPU = data:AllocateBatchMemory(conf.batchSize)
+  local batchCPU = data:AllocateBatchMemory(1)
   local batchGPU = torch.deepClone(batchCPU, 'torch.CudaTensor')
-
   local divNet = tfluids.VelocityDivergence():cuda()
 
-  -- For each sample we'll save a histogram of 10,000 bins of varying scales.
-  local nHistBins = 10000
-  local histData = {
-    nHistBins = torch.DoubleTensor({nHistBins}),
-
-    UTargetNormHist = torch.zeros(nHistBins):double(),
-    UTargetNormMin = torch.DoubleTensor({0}),
-    UTargetNormMax = torch.DoubleTensor({100}),
-
-    pTargetHist = torch.zeros(nHistBins):double(),
-    pTargetMin = torch.DoubleTensor({-10}),
-    pTargetMax = torch.DoubleTensor({10}),
-
-    pErrHist = torch.zeros(nHistBins):double(),
-    pErrMin = torch.DoubleTensor({-10}),
-    pErrMax = torch.DoubleTensor({10}),
-
-    UErrNormHist = torch.zeros(nHistBins):double(),
-    UErrNormMin = torch.DoubleTensor({0}),
-    UErrNormMax = torch.DoubleTensor({100}),
-
-    divHist = torch.zeros(nHistBins):double(),
-    divMin = torch.DoubleTensor({-100}),
-    divMax = torch.DoubleTensor({100}),
-  }
+  -- Now lets go through the dataset and get the statistics of output
+  -- divergence, etc.
+  local batchCPU = data:AllocateBatchMemory(conf.batchSize)
+  local batchGPU = torch.deepClone(batchCPU, 'torch.CudaTensor')
+  local dataInds = torch.randperm(data:nsamples()):int()
+  if conf.maxSamplesPerEpoch < math.huge then
+     local nsamples = math.min(dataInds:size(1), conf.maxSamplesPerEpoch)
+     dataInds = dataInds[{{1, nsamples}}]
+  end
 
   print('\n==> Calculating Stats: (gpu ' .. tostring(conf.gpu) .. ')')
   io.flush()
-  local normDiv = torch.zeros(#dataInds, nSteps):double()
+  local normDiv = torch.zeros(dataInds:size(1), nSteps):double()
   local nBatches = 0
 
-  for t = 1, #dataInds, conf.batchSize do
+  for t = 1, dataInds:size(1), conf.batchSize do
     if math.fmod(nBatches, 10) == 0 then
       collectgarbage()
     end
-    torch.progress(t, #dataInds)
+    torch.progress(t, dataInds:size(1))
 
     local imgList = {}  -- list of images in the current batch
     for i = t, math.min(math.min(t + conf.batchSize - 1, data:nsamples()),
-                        #dataInds) do
+                        dataInds:size(1)) do
       table.insert(imgList, dataInds[i])
     end
 
@@ -97,50 +77,32 @@ function torch.calcStats(input)
     local pTarget, UTarget, flags = torch.parseModelTarget(target)
     local pErr = pPred - pTarget
     local UErr = UPred - UTarget
-    local div = divNet:forward({UPred, flags}) 
      
-    -- Record UTarget, pTarget, pErr, UErr, div.
-    -- We can't store ALL the dataset voxels in memory. So we need to create
-    -- some sort of compressed representation of them that's still helpful
-    -- statistics for debugging.
-    -- --> The best I could come up with is a histogram.
-    local function createHist(data, min, max)
-      if data:size(1) > 1 then
-        data = torch.norm(data, 1, 2)  -- Record histogram of L2 mag.
-      end
-      data = data:view(data:numel())  -- Vectorize to 1D.
-      local hist = torch.histc(data:float(), nHistBins, min[1], max[1])
-      return hist
-    end
-    for i = 1, #imgList do
-      local hist = createHist(UTarget[i], histData.UTargetNormMin,
-                              histData.UTargetNormMax)
-      histData.UTargetNormHist:add(hist)
-
-      hist = createHist(pTarget[i], histData.pTargetMin,
-                        histData.pTargetMax)
-      histData.pTargetHist:add(hist)          
-
-      hist = createHist(pErr[i], histData.pErrMin, histData.pErrMax)
-      histData.pErrHist:add(hist)    
-
-      hist = createHist(UErr[i], histData.UErrNormMin, histData.UErrNormMax)
-      histData.UErrNormHist:add(hist)
-
-      hist = createHist(div[i], histData.divMin, histData.divMax)
-      histData.divHist:add(hist)    
-    end
-
     -- Now record divergence stability vs time.
     -- Restart the sim from the target frame.
     local p, U, flags, density = tfluids.getPUFlagsDensityReference(batchGPU)
     U:copy(batchGPU.UTarget)
     p:copy(batchGPU.pTarget)
 
+
+    -- Try Zeroing the divergence using Jacobi (PCG would be too slow here).
+    --[[
+    mconf.trainTargetSource = 'jacobi'
+    mconf.maxIter = 50
+    tfluids.calcPUTargets(conf, mconf, batchGPU, model)
+    --]]
+    -- Just use the zero divergence manta frame. 
+    p:copy(pTarget)
+    U:copy(UTarget)
+
     -- Record the divergence of the start frame.
+    div = divNet:forward({U, flags})
+    local iout = t
     for i = 1, #imgList do
-      normDiv[{imgList[i], 1}] = div[i]:norm()
+      normDiv[{iout, 1}] = div[i]:norm()
+      iout = iout + 1
     end
+    mconf.gravityScale = 0
 
     for j = 2, nSteps do
       local outputDiv = false
@@ -148,13 +110,15 @@ function torch.calcStats(input)
       local p, U, flags, density =
           tfluids.getPUFlagsDensityReference(batchGPU)
       div = divNet:forward({U, flags})
+      local iout = t
       for i = 1, #imgList do
-        normDiv[{imgList[i], j}] = div[i]:norm()
+        normDiv[{iout, j}] = div[i]:norm()
+        iout = iout + 1
       end
     end
     nBatches = nBatches + 1
   end
-  torch.progress(#dataInds, #dataInds)  -- Finish the progress bar.
+  torch.progress(dataInds:size(1), dataInds:size(1))  -- Finish the progress bar.
 
-  return {normDiv = normDiv, histData = histData}
+  return {normDiv = normDiv}
 end

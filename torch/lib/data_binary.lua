@@ -267,7 +267,7 @@ function DataBinary:_visualizeBatchData(data, legend, depth)
   assert(data.p ~= nil and data.flags ~= nil and data.U ~= nil)
 
   legend = legend or ''
-  depth = depth or math.ceil(U:size(3) / 2)
+  depth = depth or math.ceil(data.U:size(3) / 2)
   local nrow = math.floor(math.sqrt(data.flags:size(1)))
   local zoom = 1024 / (nrow * self.xdim)
   zoom = math.min(zoom, 2)
@@ -280,7 +280,9 @@ function DataBinary:_visualizeBatchData(data, legend, depth)
   Ux = data.U[{{}, {1}}]:float():select(3, depth)
   Uy = data.U[{{}, {2}}]:float():select(3, depth)
   flags = data.flags:float():select(3, depth)
-  density = data.density:float():select(3, depth)
+  if (data.density ~= nil) then
+    density = data.density:float():select(3, depth)
+  end
 
   local scaleeach = false;
   image.display{image = p, zoom = zoom, padding = 2, nrow = nrow,
@@ -291,8 +293,10 @@ function DataBinary:_visualizeBatchData(data, legend, depth)
     legend = (legend .. ': Uy'), scaleeach = scaleeach}
   image.display{image = flags, zoom = zoom, padding = 2, nrow = nrow,
     legend = (legend .. ': flags'), scaleeach = scaleeach}
-  image.display{image = density, zoom = zoom, padding = 2, nrow = nrow,
-    legend = (legend .. ': density'), scaleeach = scaleeach}
+  if (density ~= nil) then
+    image.display{image = density, zoom = zoom, padding = 2, nrow = nrow,
+      legend = (legend .. ': density'), scaleeach = scaleeach}
+  end
 end
 
 function DataBinary:visualizeBatch(conf, mconf, imgList, depth)
@@ -326,7 +330,7 @@ function DataBinary:visualizeBatch(conf, mconf, imgList, depth)
   end
 
   local range = {1, #imgList}
-  for key, value in pairs(batchCPU) do
+  for key, value in pairs(batchGPU) do
     batchGPU[key] = value[{range}]  -- Just pick the samples in the imgList.
   end
 

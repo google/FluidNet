@@ -157,6 +157,7 @@ local flagsToOccupancyNet = tfluids.FlagsToOccupancy():cuda()
 -- Remove buoyancy for this demo (can be toggled on later).
 mconf.buoyancyScale = 0
 mconf.vorticityConfinementAmp = 0
+mconf.gravityScale = 0
 mconf.dt = 4 / 60
 mconf.simMethod = 'convnet'
 mconf.advectionMethod = 'maccormackOurs'
@@ -217,14 +218,12 @@ function tfluids.keyboardFunc(key, x, y)
   elseif key == 114 then  -- 'r'
     print("Re-Loading Data!")
     tfluids.loadData()
-  elseif key == 99 then  -- 'c'
-    mconf.vorticityConfinementAmp = (mconf.vorticityConfinementAmp +
-                                     0.5 * tfluids.getDx(batchCPU.flags))
+  elseif key == 46 then  -- '.'
+    mconf.vorticityConfinementAmp = (mconf.vorticityConfinementAmp + 0.5)
     print("mconf.vorticityConfinementAmp = " .. mconf.vorticityConfinementAmp)
-  elseif key == 120 then -- 'x'
+  elseif key == 44 then -- ','
     mconf.vorticityConfinementAmp =
-        math.max(mconf.vorticityConfinementAmp -
-                 0.5 * tfluids.getDx(batchCPU.flags), 0)
+        math.max(mconf.vorticityConfinementAmp - 0.5, 0)
     print("mconf.vorticityConfinementAmp = " .. mconf.vorticityConfinementAmp)
   elseif key == 97 then  -- 'a'
     local methods = {'maccormackOurs', 'maccormack', 'euler', 'eulerOurs'}
@@ -259,6 +258,14 @@ function tfluids.keyboardFunc(key, x, y)
       tfluids.createPlumeBCs(batchGPU, densityVal, uScale, rad)
       print('Plume BCs ON')
     end
+  elseif key == 109 then  -- 'm'
+    if mconf.gravityScale <= 0 then
+      mconf.gravityScale = 1
+      print('gravity ON')
+    else
+      mconf.gravityScale = 0
+      print('gravity OFF')
+    end
   elseif key == 110 then  -- 'n'
     if mconf.buoyancyScale == 0 then
       mconf.buoyancyScale = 1
@@ -290,12 +297,12 @@ print('  "d" render divergence ON/OFF')
 print('  "r" reload the data')
 print('  "g" render obstacles ON/OFF')
 print('\n  MODEL SETTINGS:')
-print('  "c" increase vorticity confinement')
-print('  "x" decrease vorticity confinement')
+print('  "." / "," increase or decrease vorticity confinement')
 print('  "a" cycle first / second order advection methods')
 print('  "+" / "-" increase or decrease timestep')
 print('  "b" toggle "plume" boundary condition ON/OFF')
 print('  "n" toggle buoyancy ON/OFF')
+print('  "m" toggle gravity ON/OFF')
 print('  "s" toggle simulation method (convnet / jacobi / pcg)')
 print('')
 

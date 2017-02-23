@@ -158,8 +158,7 @@ function torch.defineModelGraph(conf, mconf, data)
   -- divergence free pressure.
   local p
  
-  local osize, ksize, psize, usize, rank
-  local interFeats
+  local osize, ksize, psize, usize, rank, interFeats, gatedConv
 
   if not mconf.is3D then
     if mconf.modelType == 'tog' then
@@ -169,6 +168,7 @@ function torch.defineModelGraph(conf, mconf, data)
       psize = {2, 1, 1, 1, 1, 1, 1}  -- pooling decimation size (1: no pooling)
       usize = {1, 1, 1, 1, 1, 1, 2}  -- upsampling size (1 == no upsampling).
       rank = {2, 2, 2, 2, 2, 2, 2}
+      gatedConv = {false, false, false, false, false, false, false}
       interFeats = {nil, nil, nil, nil, nil, nil, nil}
 
       -- Note: upsampling is done WITHIN the conv layer (using
@@ -182,6 +182,7 @@ function torch.defineModelGraph(conf, mconf, data)
       psize = {1, 1, 1, 1, 1}  -- pooling decimation size (1: no pooling)
       usize = {1, 1, 1, 1, 1}  -- upsampling size (1 == no upsampling).
       rank = {2, 2, 2, 2, 2}
+      gatedConv = {false, false, false, false, false}
       interFeats = {nil, nil, nil, nil, nil}
     elseif mconf.modelType == 'yang' then
       -- From the paper: Data-driven projection method in fluid
@@ -200,18 +201,20 @@ function torch.defineModelGraph(conf, mconf, data)
       psize = {1, 1, 1, 1}  -- They do not pool or upsample
       usize = {1, 1, 1, 1}  -- They do not pool or upsample
       rank = {2, 2, 2, 2}  -- Always full rank.
+      gatedConv = {false, false, false, false}
       interFeats = {nil, nil, nil, nil}
     else
       error('Incorrect modelType for 2D model.')
     end
   else
+    -- 3D Model.
     if mconf.modelType == 'tog' then
-      -- Fast model.
       osize = {16, 16, 16, 16, 32, 32, 1}
       ksize = {3, 3, 3, 3, 1, 1, 3}
       psize = {2, 2, 1, 1, 1, 1, 1}
       usize = {1, 1, 1, 1, 1, 2, 2}
       rank = {3, 3, 3, 3, 3, 3, 3}
+      gatedConv = {false, false, false, false, false, false, false}
       interFeats = {nil, nil, nil, nil, nil, nil, nil}
     elseif mconf.modelType == 'default' then
       osize = {8, 8, 8, 8, 1}
@@ -219,6 +222,7 @@ function torch.defineModelGraph(conf, mconf, data)
       psize = {1, 1, 1, 1, 1}
       usize = {1, 1, 1, 1, 1}
       rank = {3, 3, 3, 3, 3}
+      gatedConv = {false, false, false, false, false}
       interFeats = {nil, nil, nil, nil, nil}
     elseif mconf.modelType == 'yang' then
       torch.checkYangSettings(mconf)
@@ -227,6 +231,7 @@ function torch.defineModelGraph(conf, mconf, data)
       psize = {1, 1, 1, 1}
       usize = {1, 1, 1, 1}
       rank = {3, 3, 3, 3}
+      gatedConv = {false, false, false, false}
       interFeats = {nil, nil, nil, nil}
    else
      error('Incorrect modelType for 3D model.')
@@ -259,29 +264,42 @@ function torch.defineModelGraph(conf, mconf, data)
   assert(#osize == #ksize and #osize >= 1)
   for lid = 1, #osize - 1 do
     if mconf.banksNum > 1 and lid == mconf.banksSplitStage then
-      -- Split the hidden layer into a Gaussian pyramid.
-      for ibank = 2, mconf.banksNum do
-        local modDown
-        if not mconf.is3D then
-          modDown = nn.SpatialAveragePooling(2, 2, 2, 2)
-        else
-          modDown = nn.VolumetricAveragePooling(2, 2, 2, 2, 2, 2)
+      if mconf.banksType == 'mres' then
+        -- Split the hidden layer into a Gaussian pyramid.
+        for ibank = 2, mconf.banksNum do
+          local modDown
+          if not mconf.is3D then
+            modDown = nn.SpatialAveragePooling(2, 2, 2, 2)
+          else
+            modDown = nn.VolumetricAveragePooling(2, 2, 2, 2, 2, 2)
+          end
+          hl[ibank] = modDown(hl[ibank - 1]):annotate{
+              name = 'Bank ' .. ibank .. ': downsample'}
         end
-        hl[ibank] = modDown(hl[ibank - 1]):annotate{
-            name = 'Bank ' .. ibank .. ': downsample'}
+      else
+        -- We're going to apply dilated convolutions, so no downsampling
+        -- is necessary.
+        for ibank = 2, mconf.banksNum do
+          hl[ibank] = hl[1]
+        end
       end
     end
     if mconf.banksNum > 1 and lid == mconf.banksJoinStage then
       -- Join the hidden layers together.
-      -- First bring the banks into canonical resolution.
-      for ibank = 2, mconf.banksNum do
-        local ratio = math.pow(2, ibank - 1)
-        if not mconf.is3D then
-          hl[ibank] = nn.SpatialUpSamplingNearest(ratio)(hl[ibank])
-        else
-          hl[ibank] = tfluids.VolumetricUpSamplingNearest(ratio)(hl[ibank])
+      if mconf.banksType == 'mres' then
+        -- First bring the banks into canonical resolution.
+        for ibank = 2, mconf.banksNum do
+          local ratio = math.pow(2, ibank - 1)
+          if not mconf.is3D then
+            hl[ibank] = nn.SpatialUpSamplingNearest(ratio)(hl[ibank])
+          else
+            hl[ibank] = tfluids.VolumetricUpSamplingNearest(ratio)(hl[ibank])
+          end
+          hl[ibank]:annotate{name = 'Bank ' .. ibank .. ': Upsample'}
         end
-        hl[ibank]:annotate{name = 'Bank ' .. ibank .. ': Upsample'}
+      else
+        -- Actually, nothing to do for dilated code-path. We're still at
+        -- full-res.
       end
       -- Now aggregate the hidden layers.
       if mconf.banksAggregateMethod == 'concat' then
@@ -298,21 +316,31 @@ function torch.defineModelGraph(conf, mconf, data)
     local conv
     for ibank = 1, #hl do
       print('Bank ' .. ibank .. ':')
+      local dilate = 1
+      if mconf.banksType == 'dilate' then
+        dilate = math.pow(2, ibank - 1)
+      end
       if psize[lid] > 1 then
         assert(usize[lid] == 1, 'Pooling and upsampling in the same layer!')
       end
       if mconf.banksWeightShare and ibank > 1 then
+        assert(mconf.banksType == 'concat',
+               'weight sharing not supported for dilated conv networks.')
         local curConv = conv:clone('weight', 'bias', 'gradWeight', 'gradBias')
         print('Adding shared convolution: ' .. curConv:__tostring__())
         hl[ibank] = curConv(hl[ibank])
       else
         hl[ibank], conv = torch.addConv(
             mconf, hl[ibank], inDims, osize[lid], ksize[lid], usize[lid],
-            rank[lid], interFeats[lid])
+            rank[lid], interFeats[lid], gatedConv[lid], dilate)
       end
       hl[ibank]:annotate{name = 'Bank ' .. ibank .. ': conv stage ' .. lid}
-      hl[ibank] = torch.addNonlinearity(mconf, hl[ibank])
-      hl[ibank]:annotate{name = 'Bank ' .. ibank .. ': non-linearity'}
+      if not gatedConv[lid] then
+        -- Otherwise the non-linearity is itself the gating function (which has
+        -- already been added in the addConv call).
+        hl[ibank] = torch.addNonlinearity(mconf, hl[ibank])
+        hl[ibank]:annotate{name = 'Bank ' .. ibank .. ': non-linearity'}
+      end
       if psize[lid] > 1 then
         hl[ibank] = torch.addPooling(mconf, hl[ibank], psize[lid])
       end
@@ -468,3 +496,28 @@ function torch.FPROPImage(conf, mconf, data, model, criterion, imgList)
   return err, pred, batchCPU, batchGPU
 end
 
+function torch.copyTrainingMconfParams(mconfDst, mconfSrc)
+  local vars = {'gradNormThreshold', 'lossPLambda', 'lossDivLambda',
+                'longTermDivLambda', 'longTermDivProbability', 'dt',
+                'trainBuoyancyProb', 'trainBuoyancyScale',
+                'lossFuncBorderWeight', 'lossFuncBorderWidth',
+                'gravityScale', 'trainGravityScale', 'trainGravityProb',
+                'trainVorticityConfinementAmp', 'trainVorticityConfinementProb',
+                'trainTargetSource'}
+  for _, name in pairs(vars) do
+    mconfDst[name] = mconfSrc[name]
+    local prevVal = '<undefined>'
+    if mconfDst[name] ~= nil then
+      prevVal = tostring(mconfDst[name])
+    end
+    local newVal = 'nil'
+    if mconfSrc[name] ~= nil then
+      newVal = tostring(newVal)
+    end
+    print('  copying mconf ' .. name .. ' (prev: ' .. prevVal .. ', new: ' ..
+          newVal)
+  end
+
+  mconfDst.optimState.weightDecay = mconfSrc.optimState.weightDecay
+  print('  copying mconf optimState.weightDecay')
+end

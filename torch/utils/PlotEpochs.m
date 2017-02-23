@@ -26,7 +26,7 @@ if nargin < 1
   clc;
   
   % User will select models.
-  path = '../../data/models/2017_01_26/';
+  path = '../../data/models/2017_02_13/';
 
   files = dir([path, '/*_log.txt']);
   files = {files.name};
@@ -72,28 +72,35 @@ Plot(models, handles);
 end
 
 function [] = Plot(models, handles)
-data = cell(1, length(models));
+data = {};
 
 % Get the results.
+valid_models = [];
 for i = 1:length(models)
   cur_model = models{i};
   
   disp(['Processing ', cur_model]);
   cur_data = readtable( cur_model, 'Delimiter', '\t');
-  cur_data = cur_data(:, 1:end-1);
-  data{i} = cur_data;
-  
-  if i == 1
-    header = cur_data.Properties.VariableNames;
+  if (size(cur_data, 1) == 0)
+    disp(['WARNING **** No data in ', cur_model, ' skipping ****']);
   else
-    cur_header = cur_data.Properties.VariableNames;
-    for j = 1:length(cur_header)
-      assert(strcmp(header{j}, cur_header{j}), ...
-        'cant mix models with different output types');
+    cur_data = cur_data(:, 1:end-1);
+    data{length(data) + 1} = cur_data;
+    valid_models(length(valid_models) + 1) = i;
+
+    if length(data) == 1
+      header = cur_data.Properties.VariableNames;
+    else
+      cur_header = cur_data.Properties.VariableNames;
+      for j = 1:length(cur_header)
+        assert(strcmp(header{j}, cur_header{j}), ...
+          'cant mix models with different output types');
+      end
     end
   end
 end
-
+assert(length(valid_models) >= 1, 'No models with data!');
+models = models(valid_models);
 
 % Choose the headers to plot.
 headers = data{1}.Properties.VariableNames;
@@ -140,7 +147,7 @@ assert(length(indices) > 0);
 legend_str = {};
 legend_handles = [];
 
-smoothing_window = 16;
+smoothing_window = 3;
 raw_thickness = 1.5;
 raw_alpha = 0.1;
 smooth_thickness = 2;
@@ -167,6 +174,26 @@ for i = 1:length(models)
   for j = 1:length(indices)
     y = cur_data{:, indices(j)};
     x = 1:length(y);
+    
+    % Firstly, we might have done a restart with different a different
+    % loss. This would look like 2 segments, with a sudden jump. In this
+    % case, lets just use the second segment.
+    %
+    % Unfortunately, this code will not be robust because a suddent jump
+    % might also mean instability or dynamic LR change. Therefore, we
+    % should print out to the user that we're taking a sub-set.
+    dy = abs(diff(y));
+    % Normalize the delta.
+    dy = dy / std(dy);
+    ijump = find(dy > 5, 1, 'first') + 1;  % +1 because of dy length.
+    if (~isempty(ijump))
+      disp(['WARNING: Restart detected at epoch ', ijump, ' for model:']);
+      disp(model_str);
+      x = x(ijump:end);
+      y = y(ijump:end);
+    end
+    
+    
     cur_win = max(min(smoothing_window, ceil(length(y - 1) / 3)), 2);
     if logy && ~logx
       lraw = semilogy(x, y, line_spec, 'LineWidth', raw_thickness, ...
@@ -211,7 +238,7 @@ for i = 1:length(models)
     xstart = min(xstart, x(1));
     xend = max(xend, x(end));
     ystart = min(ystart, min(y));
-    yend = max(yend, y(1));
+    yend = max(yend, max(y(:)));
     
     % For the legend we don't want the full path.
     str_decomp = strsplit(model_str, '/');

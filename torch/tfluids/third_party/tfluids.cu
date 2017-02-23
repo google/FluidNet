@@ -1228,6 +1228,7 @@ __global__ void addBuoyancy(
   }
 
 }
+
 static int tfluids_CudaMain_addBuoyancy(lua_State* L) {
   THCState* state = cutorch_getstate(L);
 
@@ -1267,6 +1268,82 @@ static int tfluids_CudaMain_addBuoyancy(lua_State* L) {
   // LaunchKernel args: lua_State, func, domain, args...
   LaunchKernel(L, &addBuoyancy, flags,
                flags, vel, factor, dev_strength, bnd);
+
+  return 0;  // Recall: number of return values on the lua stack. 
+}
+
+// *****************************************************************************
+// addGravity
+// *****************************************************************************
+
+__global__ void addGravity(
+    CudaFlagGrid flags, CudaMACGrid vel, THCDeviceTensor<float, 1> force,
+    const int32_t bnd) {
+  int32_t b, chan, k, j, i;
+  if (GetKernelIndices(flags, b, chan, k, j, i)) {
+    return;
+  }
+  if (i < bnd || i > flags.xsize() - 1 - bnd ||
+      j < bnd || j > flags.ysize() - 1 - bnd ||
+      (flags.is_3d() && (k < bnd || k > flags.zsize() - 1 - bnd))) {
+    return;
+  }
+
+  const bool curFluid = flags.isFluid(i, j, k, b);
+  const bool curEmpty = flags.isEmpty(i, j, k, b);
+
+  if (!curFluid && !curEmpty) {
+    return;
+  }
+
+  if (flags.isFluid(i - 1, j, k, b) ||
+      (curFluid && flags.isEmpty(i - 1, j, k, b))) {
+    vel(i, j, k, 0, b) += force[0];
+  }
+
+  if (flags.isFluid(i, j - 1, k, b) ||
+      (curFluid && flags.isEmpty(i, j - 1, k, b))) {
+    vel(i, j, k, 1, b) += force[1];
+  }
+
+  if (flags.is_3d() && (flags.isFluid(i, j, k - 1, b) ||
+      (curFluid && flags.isEmpty(i, j, k - 1, b)))) {
+    vel(i, j, k, 2, b) += force[2];
+  }
+}
+
+static int tfluids_CudaMain_addGravity(lua_State* L) {
+  THCState* state = cutorch_getstate(L);
+
+  // Get the args from the lua stack. NOTE: We do ALL arguments (size checking)
+  // on the lua stack.
+  THCudaTensor* tensor_u = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 1, "torch.CudaTensor"));
+  THCudaTensor* tensor_flags = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 2, "torch.CudaTensor"));
+  THCudaTensor* tensor_gravity = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 3, "torch.CudaTensor"));
+  const float dt = static_cast<float>(lua_tonumber(L, 4));
+  const bool is_3d = static_cast<bool>(lua_toboolean(L, 5));
+  THCudaTensor* tensor_force = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 6, "torch.CudaTensor"));
+
+  if (tensor_gravity->nDimension != 1 || tensor_gravity->size[0] != 3) {
+    luaL_error(L, "ERROR: gravity must be a 3D vector (even in 2D)");
+  }
+
+  CudaFlagGrid flags = toCudaFlagGrid(state, tensor_flags, is_3d);
+  CudaMACGrid vel = toCudaMACGrid(state, tensor_u, is_3d);
+
+  const float mult = dt / flags.getDx();
+  THCudaTensor_mul(state, tensor_force, tensor_gravity, mult);
+  THCDeviceTensor<float, 1> force =
+      toDeviceTensor<float, 1>(state, tensor_force);
+
+  const int32_t bnd = 1;
+  // LaunchKernel args: lua_State, func, domain, args...
+  LaunchKernel(L, &addGravity, flags,
+               flags, vel, force, bnd);
 
   return 0;  // Recall: number of return values on the lua stack. 
 }

@@ -36,8 +36,8 @@ local loosePrecision = 1e-4
 local mytester = torch.Tester()
 local test = torch.TestSuite()
 local times = {}
-local profileTimeSec = 1  -- Probably too small for any real profiling...
-local profileResolution = 128
+local profileTimeSec = 0.5  -- Probably too small for any real profiling...
+local profileResolution = 64
 local jac = nn.Jacobian
 
 local function tileToResolution(x, res)
@@ -441,7 +441,7 @@ function test.setWallBcs()
     -- We call setWallBcs three times in the Manta training code so we should
     -- test it in all cases.
     testSetWallBcs(dim, 'advect.bin', 'setWallBcs1.bin')
-    testSetWallBcs(dim, 'vorticityConfinement.bin', 'setWallBcs2.bin')
+    testSetWallBcs(dim, 'gravity.bin', 'setWallBcs2.bin')
     testSetWallBcs(dim, 'solvePressure.bin', 'setWallBcs3.bin')
   end
 end
@@ -449,7 +449,7 @@ end
 function test.velocityDivergence()
   for dim = 2, 3 do
     -- Load the input Manta data.
-    local fn = dim .. 'd_vorticityConfinement.bin'
+    local fn = dim .. 'd_gravity.bin'
     local _, U, flags, _, is3D = loadMantaBatch(fn)
     assertNotAllEqual(U)
     assertNotAllEqual(flags)
@@ -502,7 +502,7 @@ end
 function test.velocityUpdate()
   for dim = 2, 3 do
     -- Load the input Manta data.
-    local fn = dim .. 'd_vorticityConfinement.bin'
+    local fn = dim .. 'd_gravity.bin'
     local _, U, flags, _, is3D = loadMantaBatch(fn)
     assertNotAllEqual(U)
     assertNotAllEqual(flags)
@@ -591,6 +591,16 @@ function test.vorticityConfinement()
   end
 end
 
+local function getGravity(dim, flags)
+  local gStrength = tfluids.getDx(flags) / 4
+  local gravity = torch.FloatTensor({1, 2, 3})
+  if dim == 2 then
+    gravity[3] = 0
+  end
+  gravity:div(gravity:norm()):mul(gStrength)
+  return gravity
+end
+
 function test.addBuoyancy()
   for dim = 2, 3 do
     -- Load the input Manta data.
@@ -613,12 +623,7 @@ function test.addBuoyancy()
 
     -- Perform our own velocity update calculation.
     local UOurs = U:clone()  -- This is the divergent U.
-    local gStrength = tfluids.getDx(flags) / 4
-    local gravity = torch.FloatTensor({1, 2, 3})
-    if dim == 2 then
-      gravity[3] = 0
-    end
-    gravity:div(gravity:norm()):mul(gStrength)
+    local gravity = getGravity(dim, flags)
     local dt = 0.1
     tfluids.addBuoyancy(UOurs, flags:clone(), density:clone(), gravity, dt)
     local err = UManta - UOurs
@@ -629,6 +634,41 @@ function test.addBuoyancy()
     profileAndTestCuda(tfluids.addBuoyancy,
                        'addBuoyancy_' .. dim .. 'd',  
                        {UOurs, flags, density, gravity, dt})
+  end
+end
+
+function test.addGravity()
+  for dim = 2, 3 do
+    -- Load the input Manta data.
+    local fn = dim .. 'd_vorticityConfinement.bin'
+    local _, U, flags, _, is3D = loadMantaBatch(fn)
+    assertNotAllEqual(U)
+    assertNotAllEqual(flags)
+
+    assert(is3D == (dim == 3))
+    -- Now load the output Manta data.
+    fn = dim .. 'd_gravity.bin'
+    local _, UManta, flagsManta, _, is3D = loadMantaBatch(fn)
+    assert(is3D == (dim == 3))
+    assert(torch.all(torch.eq(flags, flagsManta)), 'flags changed!')
+
+    -- Make sure this isn't a trivial velocity update (i.e. that velocities
+    -- actually changed). 
+    assert((U - UManta):abs():max() > 1e-5, 'No velocities changed in Manta!')
+
+    -- Perform our own gravity calculation.
+    local UOurs = U:clone()
+    local gravity = getGravity(dim, flags)
+    local dt = 0.1
+    tfluids.addGravity(UOurs, flags:clone(), gravity, dt)
+    local err = UManta - UOurs
+    mytester:assertlt(err:abs():max(), precision,
+                      ('Error: tfluids.addGravity dim ' .. dim))
+
+    -- Now test and profile the CUDA version.
+    profileAndTestCuda(tfluids.addGravity,
+                       'addGravity_' .. dim .. 'd',
+                       {UOurs, flags, gravity, dt})
   end
 end
 
@@ -840,22 +880,13 @@ function test.solveLinearSystemPCG()
       local isNan = p:ne(p)
       mytester:assertlt(isNan:sum(), 1, 'pressure contains nan values!')
 
-      -- Remove any arbitrary constant from both ours and Manta's pressure.
       p = p:float()
       -- Pressure test removed for now. There are some examples with a very
       -- ill-posed A where Manta's pressure is arbitrarily different. Overall
       -- as long as div(U) is small, we don't care if our pressure is a little
       -- off.
-      --[[
-      local bsz = p:size(1)
-      local pMean = p:view(bsz, -1):mean(2):view(bsz, 1, 1, 1, 1)
-      p = p - pMean:expandAs(p)
-      local pMantaMean = pManta:view(bsz, -1):mean(2):view(bsz, 1, 1, 1, 1)
-      pManta = pManta - pMantaMean:expandAs(pManta)
-      local pTol = 1e-2
-      mytester:assertlt((p - pManta):abs():max(), pTol,
-                        'PCG pressure error.')
-      --]]
+      -- mytester:assertlt((p - pManta):abs():max(), pTol,
+      --                   'PCG pressure error.')
   
       -- Now calculate the velocity update using this new pressure and
       -- the subsequent divergence.
@@ -909,27 +940,14 @@ function test.solveLinearSystemJacobi()
     p = p:float()
     local pPrecision = 1e-4
     if dim == 3 then
-      pPrecision = 1e-2
+      pPrecision = 1e-3
     end
-    -- Note: Jacobi takes a REALLY long to settle any non-zero pressure
-    -- constant. This is because the relaxation has to settle everywhere.
-    -- However, constant pressure is completely ignored during the velocity
-    -- update (since we take grad(p)). Therefore we're free to subtract off
-    -- any pressure mean from ours and manta's solution and still have a valid
-    -- test.
     -- Pressure test removed for now. There are some examples with a very
     -- ill-posed A where Manta's pressure is arbitrarily different. Overall
     -- as long as div(U) is small, we don't care if our pressure is a little
     -- off.
-    --[[
-    local bsz = p:size(1)
-    local pMean = p:view(bsz, -1):mean(2):view(bsz, 1, 1, 1, 1)
-    p = p - pMean:expandAs(p)
-    local pMantaMean = pManta:view(bsz, -1):mean(2):view(bsz, 1, 1, 1, 1)
-    pManta = pManta - pMantaMean:expandAs(pManta)
-    mytester:assertlt((p - pManta):abs():max(), pPrecision,
-                      'Jacobi pressure error.')
-    --]]
+    -- mytester:assertlt((p - pManta):abs():max(), pPrecision,
+    --                   'Jacobi pressure error.')
 
     -- Now calculate the velocity update using this new pressure and
     -- the subsequent divergence.
@@ -942,7 +960,114 @@ function test.solveLinearSystemJacobi()
     mytester:assertlt((UNew - UManta):abs():max(), 1e-4,
                       'Jacobi velocity error after velocityUpdate.')
   end
-end 
+end
+
+function test.normalizePressureMean2D()
+  -- We're going to create some pockets of fluid cells in non-fluid cells
+  -- and check that the mean is subtracted off.
+  local bsz = torch.random(1, 5)
+  local d = 1
+  local h = torch.random(16, 32)
+  local w = torch.random(16, 32)
+
+  local flags = torch.Tensor(bsz, 1, d, h, w)
+  flags:fill(tfluids.CellType.TypeObstacle)
+  local p = torch.Tensor(bsz, 1, d, h, w):fill(0)
+  local pNorm = p:clone()
+
+  for b = 1, bsz do
+    -- Make 4 axis aligned quadrants and fill them with random stuff.
+    local splitX = torch.random(2, w - 3)  -- Allow a border around and btw.
+    local splitY = torch.random(2, h - 3)
+
+    local function genQuadrant(rangeY, rangeX)
+      flags[{b, 1, {}, rangeY, rangeX}]:fill(tfluids.CellType.TypeFluid)
+      local quad = p[{b, 1, {}, rangeY, rangeX}]
+      quad:uniform():add(1 + torch.uniform())
+      local quadNorm = pNorm[{b, 1, {}, rangeY, rangeX}]
+      quadNorm:copy(quad):add(-quad:mean())
+      assert(quadNorm:mean() < 1e-6)
+    end
+    
+    local y0 = {2, splitY}
+    local y1 = {splitY + 2, h - 1}
+    local x0 = {2, splitX}
+    local x1 = {splitX + 2, w - 1} 
+    genQuadrant(y0, x0)
+    genQuadrant(y0, x1)
+    genQuadrant(y1, x0)
+    genQuadrant(y1, x1)
+  end
+
+  assert((p - pNorm):abs():max() > 0)  -- Shouldn't be equal.
+  local pNormOut = p:clone()
+  tfluids.normalizePressureMean(pNormOut, flags, false)
+  mytester:assertlt((pNormOut - pNorm):abs():max(), precision, 'CPU error')
+
+  -- Also test the function on the GPU.
+  local pNormGPU = p:cuda()
+  local flagsGPU = flags:cuda()
+  tfluids.normalizePressureMean(pNormGPU, flagsGPU, false)
+  mytester:assertlt((pNormGPU:double() - pNorm):abs():max(), precision,
+                    'GPU error')
+end
+
+function test.normalizePressureMean3D()
+  -- We're going to create some pockets of fluid cells in non-fluid cells
+  -- and check that the mean is subtracted off.
+  local bsz = torch.random(1, 5)
+  local d = torch.random(16, 32)
+  local h = torch.random(16, 32)
+  local w = torch.random(16, 32)
+
+  local flags = torch.Tensor(bsz, 1, d, h, w)
+  flags:fill(tfluids.CellType.TypeObstacle)
+  local p = torch.Tensor(bsz, 1, d, h, w):fill(0)
+  local pNorm = p:clone()
+
+  for b = 1, bsz do
+    -- Make 4 axis aligned quadrants and fill them with random stuff.
+    local splitX = torch.random(2, w - 3)  -- Allow a border around and btw.
+    local splitY = torch.random(2, h - 3)
+    local splitZ = torch.random(2, d - 3)
+
+    local function genOctant(rangeZ, rangeY, rangeX)
+      flags[{b, 1, rangeZ, rangeY, rangeX}]:fill(tfluids.CellType.TypeFluid)
+      local quad = p[{b, 1, rangeZ, rangeY, rangeX}]
+      quad:uniform():add(1 + torch.uniform())  
+      local quadNorm = pNorm[{b, 1, rangeZ, rangeY, rangeX}]
+      quadNorm:copy(quad):add(-quad:mean())
+      assert(quadNorm:mean() < 1e-6)   
+    end
+
+    local z0 = {2, splitZ}
+    local z1 = {splitZ + 2, d - 1}
+    local y0 = {2, splitY}
+    local y1 = {splitY + 2, h - 1}
+    local x0 = {2, splitX}
+    local x1 = {splitX + 2, w - 1}
+    genOctant(z0, y0, x0)
+    genOctant(z0, y0, x1)
+    genOctant(z0, y1, x0)
+    genOctant(z0, y1, x1)
+    genOctant(z1, y0, x0)
+    genOctant(z1, y0, x1)
+    genOctant(z1, y1, x0)
+    genOctant(z1, y1, x1)  
+  end
+
+  assert((p - pNorm):abs():max() > 0)  -- Shouldn't be equal.
+  local pNormOut = p:clone()
+  tfluids.normalizePressureMean(pNormOut, flags, true)
+  mytester:assertlt((pNormOut - pNorm):abs():max(), precision, 'CPU error')
+
+  -- Also test the function on the GPU.
+  local pNormGPU = p:cuda()
+  local flagsGPU = flags:cuda()
+  tfluids.normalizePressureMean(pNormGPU, flagsGPU, true)
+  mytester:assertlt((pNormGPU:double() - pNorm):abs():max(), 1e-5,
+                    'GPU error')
+end
 
 function test.rectangularBlur()
   for dim = 2, 3 do

@@ -58,9 +58,11 @@ if __name__ == "__main__":
   outputFolder = os.getcwd() + "/voxels_demo/"
   if not os.path.exists(outputFolder):
     os.makedirs(outputFolder)
-  create_binvox_file("Y91_arc.obj", inputFolder, outputFolder, 64)
-  create_binvox_file("bunny.capped.obj", inputFolder, outputFolder, 64)
-  
+  sizes = [8, 16, 32, 64, 128, 256]
+  for i in range(len(sizes)):
+    create_binvox_file("Y91_arc.obj", inputFolder, outputFolder, sizes[i])
+    create_binvox_file("bunny.capped.obj", inputFolder, outputFolder, sizes[i])
+
   # Now create the test and training sets.
   sizes = [8, 16, 32]
   total = len(fileList) * len(sizes)

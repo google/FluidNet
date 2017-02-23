@@ -1233,6 +1233,79 @@ static int tfluids_(Main_addBuoyancy)(lua_State *L) {
 }
 
 // *****************************************************************************
+// addGravity
+// *****************************************************************************
+
+static int tfluids_(Main_addGravity)(lua_State *L) {
+  // Get the args from the lua stack. NOTE: We do ALL arguments (size checking)
+  // on the lua stack.
+  THTensor* tensor_u =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 1, torch_Tensor));
+  THTensor* tensor_flags =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 2, torch_Tensor));
+  THTensor* tensor_gravity =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 3, torch_Tensor));
+  const real dt = static_cast<real>(lua_tonumber(L, 4));
+  const bool is_3d = static_cast<bool>(lua_toboolean(L, 5));
+
+  if (tensor_gravity->nDimension != 1 || tensor_gravity->size[0] != 3) {
+    luaL_error(L, "ERROR: gravity must be a 3D vector (even in 2D)");
+  }
+  const real* gdata = THTensor_(data)(tensor_gravity);
+
+  tfluids_(FlagGrid) flags(tensor_flags, is_3d);
+  tfluids_(MACGrid) vel(tensor_u, is_3d);
+
+  const tfluids_(vec3) force = (tfluids_(vec3)(gdata[0], gdata[1], gdata[2]) *
+                                (dt / flags.getDx()));
+
+  const int32_t xsize = flags.xsize();
+  const int32_t ysize = flags.ysize();
+  const int32_t zsize = flags.zsize();
+  const int32_t nbatch = flags.nbatch();
+  for (int32_t b = 0; b < nbatch; b++) {
+    int32_t k, j, i;
+    const int32_t bnd = 1;
+#pragma omp parallel for collapse(3) private(k, j, i)
+    for (k = 0; k < zsize; k++) {
+      for (j = 0; j < ysize; j++) {
+        for (i = 0; i < xsize; i++) {
+          if (i < bnd || i > xsize - 1 - bnd ||
+              j < bnd || j > ysize - 1 - bnd ||
+              (is_3d && (k < bnd || k > zsize - 1 - bnd))) {
+            // No buoyancy on the border.
+            continue;
+          }
+
+          const bool curFluid = flags.isFluid(i, j, k, b);
+          const bool curEmpty = flags.isEmpty(i, j, k, b);
+
+          if (!curFluid && !curEmpty) {
+            continue;
+          }
+      
+          if (flags.isFluid(i - 1, j, k, b) ||
+              (curFluid && flags.isEmpty(i - 1, j, k, b))) {
+            vel(i, j, k, 0, b) += force.x;
+          }
+
+          if (flags.isFluid(i, j - 1, k, b) ||
+              (curFluid && flags.isEmpty(i, j - 1, k, b))) {
+            vel(i, j, k, 1, b) += force.y;
+          }
+
+          if (flags.is_3d() && (flags.isFluid(i, j, k - 1, b) ||
+              (curFluid && flags.isEmpty(i, j, k - 1, b)))) {
+            vel(i, j, k, 2, b) += force.z;
+          }
+        }
+      }
+    }
+  }
+  return 0;  // Recall: number of return values on the lua stack. 
+}
+
+// *****************************************************************************
 // vorticityConfinement
 // *****************************************************************************
 

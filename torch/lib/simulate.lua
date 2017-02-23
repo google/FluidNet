@@ -26,7 +26,7 @@ function tfluids.getPUFlagsDensityReference(batchData)
   local p = batchData.pDiv
   local U = batchData.UDiv
   local flags = batchData.flags
-  local density = batchData.density  -- Optional field.
+  local density = batchData.density or batchData.densityDiv  -- Optional field.
   return p, U, flags, density
 end
 
@@ -201,10 +201,22 @@ function tfluids.simulate(conf, mconf, batch, model, outputDiv)
   -- Set the manual boundary conditions.
   setConstVals(batch, p, U, flags, density)
 
-  -- Add external forces (buoyancy and gravity).
+  local function getGravity(mconf)
+    local gravity
+    if mconf.gravity == nil then
+      gravity = torch.Tensor():typeAs(U):resize(3):fill(0)
+      gravity[2] = 1  -- Default gravity direction.
+    else
+      gravity = mconf.gravity:clone()
+    end
+    return gravity
+  end
+
+  -- Add external forces: buoyancy.
   if density ~= nil and mconf.buoyancyScale > 0 then
-    local gravity = U:new():resize(3)
-    gravity[2] = (-tfluids.getDx(flags) / 4) * mconf.buoyancyScale
+    local gravity = getGravity(mconf) 
+    gravity:mul(-(tfluids.getDx(flags) / 4) * mconf.buoyancyScale)
+
     if type(density) == 'table' then
       -- Just use the first channel (TODO(tompson): average the channels)
       tfluids.addBuoyancy(U, flags, density[1], gravity, mconf.dt)
@@ -213,12 +225,17 @@ function tfluids.simulate(conf, mconf, batch, model, outputDiv)
     end
   end
 
-  -- TODO(tompson): Add support for gravity.
+  -- Add external forces: gravity.
+  if mconf.gravityScale > 0 then
+    local gravity = getGravity(mconf)
+    gravity:mul((-tfluids.getDx(flags) / 4) * mconf.gravityScale)
+    tfluids.addGravity(U, flags, gravity, mconf.dt)
+  end
 
-  -- Add vorticity confinement.
+  -- Add external forces: vorticity confinement.
   if mconf.vorticityConfinementAmp > 0 then
     local amp = tfluids.getDx(flags) * mconf.vorticityConfinementAmp
-    tfluids.vorticityConfinement(U, flags, mconf.vorticityConfinementAmp)
+    tfluids.vorticityConfinement(U, flags, amp)
   end
 
   if outputDiv then
@@ -228,7 +245,19 @@ function tfluids.simulate(conf, mconf, batch, model, outputDiv)
   end
 
   -- Set the constant domain values.
+  if mconf.simMethod ~= 'convnet' then
+    -- Jacobi and PCG methods need this called explicitly.
+    tfluids.setWallBcsForward(U, flags)
+  end
   setConstVals(batch, p, U, flags, density)
+
+  local t0
+  if tfluids.profilePressure then
+    -- this synchronize call WILL effect performance (flushes the buffer), but
+    -- there's no other way.
+    cutorch.synchronize()
+    t0 = sys.clock()
+  end
 
   if mconf.simMethod == nil or mconf.simMethod == 'convnet' then
     -- FPROP the model to perform the pressure projection & velocity
@@ -242,8 +271,6 @@ function tfluids.simulate(conf, mconf, batch, model, outputDiv)
     p:copy(pPred)
     U:copy(UPred)
   else
-    -- tfluids.setWallBcsForward(U, flags)
-
     -- Calculate the RHS of the linear system (divergence).
     batch.div = batch.div or p:clone()
     batch.div:typeAs(U):resizeAs(p)
@@ -253,23 +280,41 @@ function tfluids.simulate(conf, mconf, batch, model, outputDiv)
     local residual
     if mconf.simMethod == 'pcg' then
       local tol = 1e-4
-      local maxIter = 100
+      local maxIter = mconf.maxIter or 100
       local precondType = 'ic0'  -- options: 'ic0', 'none', 'ilu0'
       residual = tfluids.solveLinearSystemPCG(
           p, flags, batch.div, mconf.is3D, tol, maxIter, precondType)
     elseif mconf.simMethod == 'jacobi' then
       local pTol = 0  -- Essentially, this means a fixed number of iter.
-      local maxIter = 100  -- It has VERY slow convergence. Run for long time.
+      local maxIter = mconf.maxIter or 100
       residual = tfluids.solveLinearSystemJacobi(
           p, flags, batch.div, mconf.is3D, pTol, maxIter)
     else
       error('mconf.simMethod (' .. mconf.simMethod .. ') is not a valid option')
     end
+    --[[
+    local residualThreshold = 1e-3
+    if residual > residualThreshold then
+      print('WARNING: PCG / Jacobi residual > ' .. residualThreshold)
+    end
+    --]]
 
     -- Now update velocity (using the pressure gradient).
     tfluids.velocityUpdateForward(U, flags, p)
+  end
 
-    -- tfluids.setWallBcsForward(U, flags)
+  if tfluids.profilePressure then
+    -- this synchronize call WILL effect performance (flushes the buffer), but
+    -- there's no other way.
+    cutorch.synchronize()
+    local t1 = sys.clock()
+    if tfluids.profilePressureTime == nil then
+      tfluids.profilePressureTime = 0  -- Skip the first sample.
+      tfluids.profilePressureCount = 0
+    else
+      tfluids.profilePressureTime = tfluids.profilePressureTime + (t1 - t0)
+      tfluids.profilePressureCount = tfluids.profilePressureCount + 1
+    end
   end
 
   -- Set the constant domain values.
@@ -279,4 +324,91 @@ function tfluids.simulate(conf, mconf, batch, model, outputDiv)
   -- up to inf. If the velocity is this big we have other problems other than
   -- amplitude truncation).
   U:clamp(-1e6, 1e6)
+end
+
+-- During training we might want to perform the linear projection using our
+-- Jacobi or PCG methods, which enables us to perform data augmentation or
+-- add future frame pressure and velocity terms.
+function tfluids.calcPUTargets(conf, mconf, batch, model)
+  if mconf.trainTargetSource == 'manta' then
+    error('target source is manta, this method should not be called!')
+  end
+
+  local modelInput = torch.getModelInput(batch)
+  local pDiv, UDiv, flags = torch.parseModelInput(modelInput)
+
+  local modelTarget = torch.getModelTarget(batch)
+  local pTarget, UTarget, _ = torch.parseModelTarget(modelTarget)
+
+  tfluids.setWallBcsForward(UDiv, flags)
+
+  -- Calculate the RHS of the linear system (divergence).
+  batch.div = batch.div or pDiv:clone()
+  batch.div = batch.div:typeAs(pDiv):resizeAs(pDiv)
+  tfluids.velocityDivergenceForward(UDiv, flags, batch.div)
+
+  -- Solve for pressure.
+  local residual
+  if mconf.trainTargetSource == 'pcg' then
+    local tol = 1e-4
+    local maxIter = mconf.maxIter or 100
+    local precondType = 'ic0'  -- options: 'ic0', 'none', 'ilu0'
+    residual = tfluids.solveLinearSystemPCG(
+        pTarget, flags, batch.div, mconf.is3D, tol, maxIter, precondType)
+  elseif mconf.trainTargetSource == 'jacobi' then
+    local pTol = 0  -- Essentially, this means a fixed number of iter.
+    local maxIter = mconf.maxIter or 50
+    residual = tfluids.solveLinearSystemJacobi(
+        pTarget, flags, batch.div, mconf.is3D, pTol, maxIter)
+  else
+    error('mconf.trainTargetSource (' .. mconf.trainTargetSource ..
+          ') is not a valid option')
+  end
+
+  -- Now update velocity (using the pressure gradient).
+  UTarget:copy(UDiv)
+  tfluids.velocityUpdateForward(UTarget, flags, pTarget)
+  tfluids.setWallBcsForward(UTarget, flags)
+end
+
+function tfluids.dataAugmentation(conf, mconf, batch)
+  -- For now we'll just add geometry, buoyancy and vorticity confinement.
+  -- Note that these may or may not have been added to the Manta UDiv field
+  -- however it does not hurt to add additional divergence.
+  if mconf.trainTargetSource == 'manta' then
+    error('target source is manta, this method should not be called!')
+  end
+
+  -- Note: pDiv is just the previous frame's pressure, we don't need to
+  -- augment it.
+  local modelInput = torch.getModelInput(batch)
+  local _, UDiv, flags = torch.parseModelInput(modelInput)
+  local density = batch.density or batch.densityDiv
+
+  -- This method assumes that we have defined a gravity vector (run_epoch.lua),
+  -- if we are going to add buoyancy and gravity.
+
+    -- Add external forces: buoyancy.
+  if density ~= nil and mconf.buoyancyScale > 0 then
+    assert(mconf.gravity ~= nil)
+    assert(torch.isTensor(density), 'density while training should be a tensor')
+    tfluids.addBuoyancy(UDiv, flags, density, mconf.gravity, mconf.dt)
+  end
+  
+  -- Add external forces: gravity.
+  if mconf.gravityScale > 0 then
+    assert(mconf.gravity ~= nil)
+    local gravity = mconf.gravity:clone()
+    gravity:mul((-tfluids.getDx(flags) / 4) * mconf.gravityScale)
+    tfluids.addGravity(UDiv, flags, gravity, mconf.dt)
+  end
+
+  -- Add external forces: vorticity confinement.
+  if mconf.vorticityConfinementAmp > 0 then
+    local amp = tfluids.getDx(flags) * mconf.vorticityConfinementAmp
+    tfluids.vorticityConfinement(UDiv, flags, amp)
+  end
+
+  -- TODO(tompson): Add random noise (using perlin noise with random PSD
+  -- probably).
 end

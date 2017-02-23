@@ -430,7 +430,7 @@ local function vorticityConfinement(U, flags, strength)
 end
 rawset(tfluids, 'vorticityConfinement', vorticityConfinement)
 
--- Add buoyancy force. Note: Unlike vorticityConfinement, addBuoyance has a dt
+-- Add buoyancy force. Note: Unlike vorticityConfinement, addBuoyancy has a dt
 -- term.
 -- Note: Buoyancy is added IN-PLACE.
 --
@@ -469,6 +469,42 @@ local function addBuoyancy(U, flags, density, gravity, dt)
   U.tfluids.addBuoyancy(U, flags, density, gravity, strength, dt, is3D)
 end
 rawset(tfluids, 'addBuoyancy', addBuoyancy)
+
+-- Add gravity force. Note: Unlike vorticityConfinement, addGravity has a dt
+-- term.
+-- Note: gravity is added IN-PLACE.
+--
+-- @param U - vel field (size(2) can be 2 or 3, indicating 2D / 3D)
+-- @param flags - input occupancy grid
+-- @param gravity - 3D vector indicating direction of gravity.
+-- @param dt - scalar timestep.
+local function addGravity(U, flags, gravity, dt)
+  -- Check arguments here (it's easier from lua).
+  assert(U:dim() == 5 and flags:dim() == 5, 'Dimension mismatch')
+  assert(flags:size(2) == 1, 'flags is not scalar')
+  local bsz = flags:size(1)
+  local d = flags:size(3)
+  local h = flags:size(4)
+  local w = flags:size(5)
+
+  local is3D = U:size(2) == 3
+  if not is3D then
+    assert(d == 1, '2D velocity field but zdepth > 1')
+    assert(U:size(2) == 2, '2D velocity field must have only 2 channels')
+  end
+  assert((U:size(1) == bsz and U:size(3) == d and U:size(4) == h and
+          U:size(5) == w), 'Size mismatch')
+
+  assert(U:isContiguous() and flags:isContiguous(), 'Input is not contiguous')
+  assert(torch.isTensor(gravity) and gravity:dim() == 1 and
+         gravity:size(1) == 3, 'gravity must be a 3D vector (even in 2D).')
+  assert(torch.type(dt) == 'number', 'time step must be a number')
+
+  local force = getTempStorage(U:type(), {{3}})[1]  -- Used in cuda version.
+
+  U.tfluids.addGravity(U, flags, gravity, dt, is3D, force)
+end   
+rawset(tfluids, 'addGravity', addGravity)
 
 -- flipY will render the field upside down (required to get alignment with
 -- grid = 0 on the bottom of the OpenGL context).
@@ -689,9 +725,45 @@ local function solveLinearSystemJacobi(p, flags, div, is3D, pTol, maxIter,
 
   local residual = p.tfluids.solveLinearSystemJacobi(
       p, flags, div, pPrev, pDelta, pDeltaNorm, is3D, pTol, maxIter, verbose)
+
+  -- Note: unlike PCG, we do not ensure that each connected component of fluid
+  -- cells has zero mean. If this is necessary you should call
+  -- tfluids.normalizePressureMean explicitly (it's somewhat expensive).
+
   return residual
 end
 rawset(tfluids, 'solveLinearSystemJacobi', solveLinearSystemJacobi)
+
+-- This function will transfer to the CPU if p and flags are cuda tensors (and
+-- sync back). Use sparingly. TODO(tompson): do flood fill on the GPU.
+--
+-- We will perform a connected-component search (using flood-fill) to find the
+-- connected components of fluid cells, and we will then subtract the mean of
+-- each component. This removes the arbitrary DC bias in each connected
+-- component.
+--
+-- @param p: The output pressure field (i.e. the solution to A * p = div)
+-- @param flags: The input flag grid.
+local function normalizePressureMean(p, flags, is3D)
+  local pCPU = p
+  local flagsCPU = flags
+  if torch.type(p) == 'torch.CudaTensor' then  -- Assume cuda, float or double.
+    -- GPU to CPU sync.
+    pCPU = p:float()
+    flagsCPU = flags:float()
+  end
+
+  -- Need temp space for the index list.
+  local inds = getTempStorage('torch.IntTensor', {pCPU:size():totable()})[1]
+
+  pCPU.tfluids.normalizePressureMean(pCPU, flagsCPU, is3D, inds)
+
+  if torch.type(p) == 'torch.CudaTensor' then
+    -- CPU to GPU sync.
+    p:copy(pCPU)
+  end
+end
+rawset(tfluids, 'normalizePressureMean', normalizePressureMean)
 
 -- Now include the modules.
 include('flags_to_occupancy.lua')

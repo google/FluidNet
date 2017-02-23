@@ -83,6 +83,7 @@ function tfluids.loadVoxelData(filename)
   local index = 1
   local endIndex = 1
   local numVoxelsRead = 0
+  local pData1D = data1D:data()
   while ((endIndex < voxelCount) and (file:position() < endPosition)) do
     local value = file:readByte(1)[1]
     local count = file:readByte(1)[1]
@@ -94,7 +95,8 @@ function tfluids.loadVoxelData(filename)
         return 0
       end
       for i = index, endIndex do
-        data1D[i] = value
+        pData1D[i - 1] = value
+        -- data1D[i] = value
       end
 
       if value > 0 then
@@ -104,26 +106,15 @@ function tfluids.loadVoxelData(filename)
     end
 
   end
-  print("read " .. numVoxelsRead .. " voxels out of " .. voxelCount)
+  print("  Read " .. numVoxelsRead .. " voxels out of " .. voxelCount)
 
   local data = data1D:view(torch.LongStorage{dims[1], dims[2],
       dims[3]}):permute(1, 3, 2)
 
-  local count = 0
-  print("iterating through " .. voxelCount .. " voxels")
-  for z = 1, dims[3] do
-    for y = 1, dims[2] do
-      for x = 1, dims[1] do
-        if data[{ x, y, z}] > 0 then
-          count = count + 1
-        end
-      end
-    end
-  end
-  print("Found " .. count .. " voxels, expected: " .. numVoxelsRead)
+  print("  Found " .. data:sum() .. " voxels, expected: " .. numVoxelsRead)
   file:close()
 
-  tfluids.calculateBoundingBox(data)
+  local bboxMin, bboxMax = tfluids.calculateBoundingBox(data)
 
   return {dims=dims, translation=translation, scale=scale, data=data:float()}
 end

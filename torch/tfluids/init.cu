@@ -37,17 +37,39 @@ inline int32_t clamp(const int32_t x, const int32_t low, const int32_t high) {
 // Expand the CPU types (float and double).  This actually instantiates the
 // functions. Note: the order here is important.
 
-#define SOURCE_FILE "generic/vec3.cc"
-#include "generic/cc_types.h"
-#undef SOURCE_FILE
+#define torch_(NAME) TH_CONCAT_3(torch_, Real, NAME)
+#define torch_Tensor TH_CONCAT_STRING_3(torch., Real, Tensor)
+#define tfluids_(NAME) TH_CONCAT_3(tfluids_, Real, NAME)
 
-#define SOURCE_FILE "third_party/grid.cc"
-#include "generic/cc_types.h"
-#undef SOURCE_FILE
+#define real float
+#define accreal double
+#define Real Float
+#define THInf FLT_MAX
+#define TH_REAL_IS_FLOAT
+#include "generic/vec3.cc"
+#include "third_party/grid.cc"
+#include "generic/find_connected_fluid_components.cc"
+#include "generic/tfluids.cc"
+#undef accreal
+#undef real
+#undef Real
+#undef THInf
+#undef TH_REAL_IS_FLOAT
 
-#define SOURCE_FILE "generic/tfluids.cc"
-#include "generic/cc_types.h"
-#undef SOURCE_FILE
+#define real double
+#define accreal double
+#define Real Double
+#define THInf DBL_MAX
+#define TH_REAL_IS_DOUBLE
+#include "generic/vec3.cc"
+#include "third_party/grid.cc"
+#include "generic/find_connected_fluid_components.cc"
+#include "generic/tfluids.cc"
+#undef accreal
+#undef real
+#undef Real
+#undef THInf
+#undef TH_REAL_IS_DOUBLE
 
 // setfieldint pushes the index and the field value on the stack, and then
 // calls lua_settable. The setfield function assumes that before the call the
