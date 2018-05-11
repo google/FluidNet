@@ -64,6 +64,7 @@ cd FluidNet/voxelizer
 mkdir objs
 cd objs
 wget http://3d.csie.ntu.edu.tw/~dynamic/database/NTU3D.v1_0-999.zip
+# wget https://cs.nyu.edu/~schlacht/NTU3D.v1_0-999.zip  # Alternate download location.
 unzip NTU3D.v1_0-999.zip
 wget https://www.dropbox.com/sh/5f3t9abmzu8fbfx/AAAkzW9JkkDshyzuFV0fAIL3a/bunny.capped.obj
 ```
