@@ -24,6 +24,11 @@ Note: This is not an official Google product.
 UPDATES / NEWS:
 ---------------
 
+**Oct 14 2019**
+- Added a pre-trained 2D model to the repo (for use with the realtime demo). Use
+  this if you just want to visualize some output running in realtime (skipping
+  data creation, model training, etc). See realtime demo instructions below.
+
 **Oct 13 2019**
 - Verified instructions were still up to date. torch7 does not work with CUDA
   SDK newer than 9.2 (so this is what you must use). If you're using CUDA 10.0 

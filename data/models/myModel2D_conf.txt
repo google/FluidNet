@@ -1,0 +1,27 @@
+{
+  batchSize = 16,
+  dataDir = "../data/datasets/",
+  dataset = "output_current_model_sphere",
+  evaluateDuringTraining = true,
+  gpu = 1,
+  ignoreFrames = 0,
+  loadModel = false,
+  loadVoxelModel = "none",
+  lrEpochMults = {
+    1 = {
+      epoch = inf,
+      mult = 0.25,
+    },
+  },
+  maxEpochs = 5000,
+  maxSamplesPerEpoch = inf,
+  modelDir = "../data/models/",
+  modelDirname = "../data/models//myModel2D",
+  modelFilename = "myModel2D",
+  numDataThreads = 8,
+  profile = true,
+  resumeTraining = false,
+  statsSimMethod = "",
+  train = true,
+  visualizeModel = false,
+}
