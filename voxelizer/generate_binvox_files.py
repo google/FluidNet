@@ -79,5 +79,6 @@ if __name__ == "__main__":
       os.makedirs(outputFolder)
     for size in sizes:
       count = count + 1
-      print "%s - %d. Percent Complete: %.1f" % (f, size, 100.0 * (count/total))
+      print("%s - %d. Percent Complete: %.1f" % (
+          f, size, 100.0 * (count/total)))
       create_binvox_file(f, inputFolder, outputFolder, size)

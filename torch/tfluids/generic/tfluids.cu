@@ -1879,7 +1879,7 @@ static int tfluids_CudaMain_solveLinearSystemJacobi(lua_State* L) {
     THCudaTensor_csub(state, tensor_p_delta, tensor_p, 1.0f, tensor_p_prev);
     THCudaTensor_resize2d(state, tensor_p_delta, nbatch, numel);
     // Calculate L2 norm over dim 2.
-    THCudaTensor_norm(state, tensor_p_delta_norm, tensor_p_delta, 2, 1);
+    THCudaTensor_norm(state, tensor_p_delta_norm, tensor_p_delta, 2, 1, 1);
     // Put the view back.
     THCudaTensor_resize5d(state, tensor_p_delta, nbatch, 1, zsize, ysize,
                           xsize);

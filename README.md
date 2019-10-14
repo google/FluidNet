@@ -24,6 +24,31 @@ Note: This is not an official Google product.
 UPDATES / NEWS:
 ---------------
 
+**Oct 13 2019**
+- Verified instructions were still up to date. torch7 does not work with CUDA
+  SDK newer than 9.2 (so this is what you must use). If you're using CUDA 10.0 
+  or 10.1, you need to downgrade. For CUDNN make sure you install v7.6.4 for 
+  CUDA 9.2. Additionally, CUDA 9.2 does not support gcc>7 AND there seems to be
+  an issue with half float support at cutorch head. I had to install torch
+  using:
+  ```
+  ./clean.sh
+  export TORCH_NVCC_FLAGS="-D__CUDA_NO_HALF_OPERATORS__"
+  export CC=/usr/bin/gcc-7
+  export CXX=/usr/bin/g++-7
+  ./install.sh'
+  ```
+  See [here](https://github.com/torch/cutorch/issues/797) for more cuda 9.2
+  debug help. In addition to get cudnn to work with v7.6.4 I used:
+  ```
+  git clone https://github.com/soumith/cudnn.torch.git -b R7 && cd cudnn.torch
+  && luarocks make cudnn-scm-1.rockspec
+  ```
+  As discussed [here](https://github.com/soumith/cudnn.torch/issues/383).
+- Fixed a few compile issues with tfluids: missing vector and changes to
+  THCudaTensor_norm as pointed out in [issue
+  10](https://github.com/google/FluidNet/issues/10).
+
 **Feb 6 2017**
 - Huge refactoring and bug-fix update (too many to mention here!).
 - Switched data everywhere to MAC-Grid (instead of central sampling).
@@ -154,7 +179,7 @@ cd FluidNet/manta/build
 **RUNNING TORCH7 TRAINING**
 
 We assume that Torch7 is installed, otherwise follow the instructions [here](
-http://torch.ch/). We use the standard [distro](https://github.com/torch/distro) with the cuda SDK for cutorch and cunn and [cudnn](https://github.com/soumith/cudnn.torch).
+http://torch.ch/). We use CUDA 9.2 SDK and the standard distribution (pulled on Oct 13th 2019). As of 10/2019, LUA52 is broken, so now use the LUAJIT version (this is the default anyway). Lastly, there are some install notes worth reading in the Oct 2019 update above.
 
 After install torch, compile tfluids: this is our custom CUDA & C++ library that implements a large number of the modules used in the paper:
 
@@ -165,11 +190,13 @@ cd FluidNet/torch/tfluids
 luarocks make tfluids-1-00.rockspec
 ```
 
-Note: some users are reporting that you need to explicitly install findCUDA for tfluids to compile properly with CUDA 7.5 and above.
+Note #1: some users are reporting that you need to explicitly install findCUDA for tfluids to compile properly with CUDA 7.5 and above.
 
 ```
 luarocks install findCUDA
 ```
+Note #2: If THC.h cannot be found during compilation, make sure cutorch is
+installed properly (check that torch7 install.sh could find the CUDA SDK).
 
 All training related code is in `torch/` directory.  To train a model on 3D data:
 

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <vector>
+
 int findConnectedFluidComponents(
     const tfluids_(FlagGrid)& flags, THIntTensor* components,
     const int32_t ibatch, std::vector<int32_t>* component_sizes) {
