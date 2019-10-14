@@ -69,10 +69,13 @@ if conf.loadModel then
 else
   assert(not conf.resumeTraining,
          'Cant resume training without loading a model!')
+  print('Calling defineModel')
   model, mconf = torch.defineModel(conf, tr) -- in model.lua
+  print('Copying model to CUDA')
   model:cuda()
   -- Visualize the model to file.
-  if torch.loadPackageSafe('learning.lua.file') == nil then
+  if (conf.visualizeModel and 
+      torch.loadPackageSafe('learning.lua.file') == nil) then
     -- If we're using the standard distro of torch.
     graph.dot(model.fg, 'Forward Graph', conf.modelDirname .. '_fg')
     graph.dot(model.bg, 'Backward Graph', conf.modelDirname .. '_bg')

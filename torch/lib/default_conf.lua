@@ -156,6 +156,7 @@ function torch.defaultConf()
     resumeTraining = false,
     statsSimMethod = '',  -- Empty means use mconf value.
     train = true,  -- perform training (otherwise just evaluate)
+    visualizeModel = false,  -- Visualize graph.
   }
   return conf
 end
