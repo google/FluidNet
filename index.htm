@@ -1,0 +1,174 @@
+
+<!DOCTYPE html>
+<html>
+<!-- CSS and template comes from Bootstrap -->
+  <head>
+    <script src="cnn_fluids_files/jquery.js" type="text/javascript"></script>
+    <script src="cnn_fluids_files/blockui.js" type="text/javascript"></script>
+    <script src="cnn_fluids_files/highcharts.js"></script>
+    <script src="cnn_fluids_files/exporting.js"></script>
+
+    <script src="cnn_fluids_files/bootstrap.min.js"></script>
+    <script src="cnn_fluids_files/bootbox.min.js"></script>
+    
+    <title>Accelerating Eulerian Fluid Simulation With Convolutional Networks</title>
+    	
+    <link rel="stylesheet" type="text/css" href="cnn_fluids_files/bootstrap.css">
+  </head>
+  <body>
+
+    <!-- <div class="container" style="width:1268px;"> -->
+    <div class="container" style="width:90%;" name="top_container">
+      <h1><table border="0" width="100%"><tbody><tr><td><a href="">Accelerating Eulerian Fluid Simulation With Convolutional Networks</a></td><td align="right"></td></tr></tbody></table></h1>
+      
+      <div class="navbar">
+        <div class="navbar-inner">
+          <div class="container">
+            <ul class="nav">
+              <li class="active"><a class="menu_item" href="">Overview</a></li>
+              <li><a href="https://github.com/google/FluidNet" target="_blank">Code And Data</a></li>
+              <li><a class="menu_item" href="#references">References</a></li>
+              <li><a class="menu_item" href="#contact">Contact</a></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+        
+      <script type="text/javascript" charset="utf-8">
+       $(document).ready(function(){
+	 $(".span12").hide();
+         $("#overview").show();
+       });
+      </script> 
+      
+      <div class="row" style="width:95%;">
+	      <div class="span12" id="contact" style="width: 100%; display: none;">
+	        <h3>Team</h3>
+          <table><tbody><tr>
+            <td style="border-right:solid 10px transparent;"><a href="https://https://jonathantompson.github.io/"><img src="cnn_fluids_files/jonathan.jpg" style="height: 140px"></a></td>
+            <td style="border-right:solid 10px transparent;"><a href="http://cims.nyu.edu/~schlacht/"><img src="cnn_fluids_files/kris.jpg" style="height: 140px"></a></td>
+            <td style="border-right:solid 10px transparent;"><a href="http://cims.nyu.edu/~pablo/"><img src="cnn_fluids_files/pablo.jpg" style="height: 140px"></a></td>
+            <td style="border-right:solid 10px transparent;"><a href="http://mrl.nyu.edu/~perlin/"><img src="cnn_fluids_files/ken.jpg" style="height: 140px"></a></td>
+          </tr>
+          <tr>
+            <td align="center" style="font-size:16px"><a href="https://jonathantompson.github.io/">Jonathan<br>Tompson</a></td>
+            <td align="center" style="font-size:16px"><a href="http://cims.nyu.edu/~schlacht/">Kristofer<br>Schlachter</a></td>
+            <td align="center" style="font-size:16px"><a href="http://cims.nyu.edu/~pablo/">Pablo<br>Sprechmann</a></td>
+            <td align="center" style="font-size:16px"><a href="http://mrl.nyu.edu/~perlin/">Ken<br>Perlin</a></td>
+          </tr></tbody></table>
+
+          <br>
+          <p><i class="icon-envelope icon-black"></i> For questions contact Jonathan Tompson: <i>tompson@google.com</i></p>
+
+        </div>
+
+        <div class="span12" id="references" style="width: 100%; display: none;">
+          <h3>References</h3>
+          <ul>
+            <li>
+              <p><a href="http://arxiv.org/abs/1607.03597"><strong>Accelerating Eulerian Fluid Simulation With Convolutional Networks</strong></a></p>
+              <p>Jonathan Tompson, Kristofer Schlachter, Pablo Sprechmann, Ken Perlin.</p>
+              <p>2016. Arxiv preprint.</p>
+            </li>
+          </ul>
+        </div>
+
+        <div class="span12" id="overview" style="width: 100%; display: block;">
+
+          <img src="cnn_fluids_files/sample.png" style="width: 100%" align="center">
+
+          <h3>Abstract</h3>
+<p>
+Real-time simulation of fluid and smoke is a long standing problem in computer graphics, where state-of-the-art approaches require large compute resources, making real-time applications often impractical. In this work, we propose a data-driven approach that leverages the approximation power of deep-learning methods with the precision of standard fluid solvers to obtain both fast and highly realistic simulations. The proposed method solves the incompressible Euler equations following the standard operator splitting method in which a large, often ill-condition linear system must be solved. We propose replacing this system by learning a Convolutional Network (ConvNet) from a training set of simulations using a semi-supervised learning method to minimize long-term velocity divergence.
+</p>
+<p>
+ConvNets are amenable to efficient GPU implementations and, unlike exact iterative solvers, have fixed computational complexity and latency. The proposed hybrid approach restricts the learning task to a linear projection without modeling the well understood advection and body forces. We present real-time 2D and 3D simulations of fluids and smoke; the obtained results are realistic and show good generalization properties to unseen geometry.
+         </p> 
+        <h3>Video</h3>
+          <table>
+            <tr>
+              <td align="center" style="font-size:16px"><a href="https://youtu.be/w71zxkniJfo">Demo Video</a></td>
+            </tr>
+            <tr>
+              <td><iframe width="560" height="315" src="https://www.youtube.com/embed/w71zxkniJfo" frameborder="0" allowfullscreen></iframe></rd>
+            </tr>
+            <!--
+            <tr>
+              <td align="center" style="font-size:16px"><a href="https://youtu.be/5rXd5-y3sEw">Smoke Column</a></td>
+            </tr>
+            <tr>
+              <td><iframe width="560" height="315" src="https://www.youtube.com/embed/5rXd5-y3sEw" frameborder="0" allowfullscreen></iframe></rd>
+            </tr>
+            <tr>
+              <td align="center" style="font-size:16px"><a href="https://youtu.be/_2sp60SZ-NM">Arch</a></td>
+            </tr>
+            <tr>
+              <td><iframe width="560" height="315" src="https://www.youtube.com/embed/_2sp60SZ-NM" frameborder="0" allowfullscreen></iframe></rd>
+            </tr>
+            <tr>
+              <td align="center" style="font-size:16px"><a href="https://youtu.be/MR4RHm4Qf50">Stanford Bunny</a></td>
+            </tr>
+            <tr>
+              <td><iframe width="560" height="315" src="https://www.youtube.com/embed/MR4RHm4Qf50" frameborder="0" allowfullscreen></iframe></rd>
+            </tr>
+            -->
+          </table>
+
+          <h3>Citing the dataset</h3>
+          <p>
+<pre><code>@article{CNNFluid2016,
+  author = {{Tompson}, J. and {Schlachter}, K. and {Sprechmann}, P. and {Perlin}, K.},
+  title = "{Accelerating Eulerian Fluid Simulation With Convolutional Networks}",
+  journal = {ArXiv e-prints},
+  archivePrefix = "arXiv",
+  eprint = {1607.03597},
+  primaryClass = "cs.CV",
+  year = 2016,
+  month = jul,
+}</code></pre></p>
+
+          <h3>Publication</h3>
+          <table>
+            <tr>
+              <td align="center"><a href="http://arxiv.org/abs/1607.03597"><img src="cnn_fluids_files/tog_paper_thumbnail.png" style="height: 120px;"></a></td>
+              <td>&nbsp;&nbsp;&nbsp;</rd>
+              <!--
+              <td align="center"><a href="http://cims.nyu.edu/~tompson/others/paper_presentation_no_videos.pptx"><img src="cnn_fluids_files/tog_ppt_thumbnail.jpg" style="height: 120px"></a></td>
+              -->
+            </tr>
+            <tr>
+              <td align="center" style="font-size:16px"><a href="http://arxiv.org/abs/1607.03597">arxiv preprint</a></td>
+              <td>&nbsp;</rd>
+              <!--
+              <td align="center" style="font-size:16px"><a href="http://cims.nyu.edu/~tompson/others/paper_presentation_no_videos.pptx">SIGGRAPH'14 ppt</a></td>
+              -->
+            </tr>
+          </table>
+        
+        </div>
+
+
+        <div class="span12" id="download" style="width: 100%; display: block;">
+          <h3>Code and Data</h3>
+          <p>Coming soon! (contact <a href="mailto:tompson@google.com" target="_top">tompson@google.com</a> if you need immediate access to the codebase).</p>
+        </div>
+      </div>
+
+      <script>
+        <!--
+        $(".menu_item").click(function(){
+      $("ul.nav > li").removeClass("active");
+
+
+      $(".span12").hide();
+            theDiv = $(this).attr("href");
+
+              $(theDiv).show();
+        
+            $(this).closest("li").toggleClass("active");
+        });
+      </script>
+    </div>
+  </body>
+</html>
+
